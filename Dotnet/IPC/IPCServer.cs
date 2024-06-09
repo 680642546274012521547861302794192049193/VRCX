@@ -5,6 +5,7 @@
 // For a copy, see <https://opensource.org/licenses/MIT>.
 
 using System;
+using System.IO;
 using System.Collections.Generic;
 using System.IO.Pipes;
 using System.Threading.Tasks;
@@ -36,7 +37,8 @@ namespace VRCX
 
         public void CreateIPCServer()
         {
-            var ipcServer = new NamedPipeServerStream("vrcx-ipc", PipeDirection.InOut, NamedPipeServerStream.MaxAllowedServerInstances, PipeTransmissionMode.Byte, PipeOptions.Asynchronous);
+            string suffix = Environment.UserName;
+            var ipcServer = new NamedPipeServerStream("vrcx-ipc-"+suffix, PipeDirection.InOut, NamedPipeServerStream.MaxAllowedServerInstances, PipeTransmissionMode.Byte, PipeOptions.Asynchronous);
             ipcServer.BeginWaitForConnection(DoAccept, ipcServer);
         }
 
