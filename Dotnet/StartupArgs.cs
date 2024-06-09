@@ -60,7 +60,8 @@ namespace VRCX
         private static void IPCToMain()
         {
             new IPCServer().CreateIPCServer();
-            var ipcClient = new NamedPipeClientStream(".", "vrcx-ipc", PipeDirection.InOut);
+            string suffix = Environment.UserName;
+            var ipcClient = new NamedPipeClientStream(".", "vrcx-ipc-"+suffix, PipeDirection.InOut);
             ipcClient.Connect();
 
             if (ipcClient.IsConnected)
