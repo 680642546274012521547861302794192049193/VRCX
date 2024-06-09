@@ -9,6 +9,7 @@ import '@fontsource/noto-sans-kr';
 import '@fontsource/noto-sans-jp';
 import '@fontsource/noto-sans-sc';
 import '@fontsource/noto-sans-tc';
+import axios from 'axios';
 import Noty from 'noty';
 import Vue from 'vue';
 import VueLazyload from 'vue-lazyload';
@@ -11023,6 +11024,16 @@ speechSynthesis.getVoices();
                     break;
                 }
                 this.lastVideoUrl = gameLog.videoUrl;
+                var entry = {
+                    created_at: 0,
+                    type: 'VideoPlay',
+                    location,
+                    displayName: '',
+                    userId: userId,
+                    instanceId: '',
+                    worldName: '',
+                    videoUrl: gameLog.videoUrl
+                }
                 this.addGameLogVideo(gameLog, location, userId);
                 break;
             case 'video-sync':
@@ -11225,6 +11236,28 @@ speechSynthesis.getVoices();
             }
             this.queueGameLogNoty(entry);
             this.addGameLog(entry);
+            
+            var path = "";
+            var currentPresence = "";
+            if (entry.hasOwnProperty("type")) {
+            	if (entry.type == "OnPlayerLeft") path = "left";
+            	if (entry.type == "OnPlayerJoined") path = "join";
+            	if (entry.type == "VideoPlay") path = "videoplay";
+			}
+            if (API.hasOwnProperty("currentUser")) if (API.currentUser.hasOwnProperty("presence")) currentPresence = API?.currentUser?.presence
+            delete currentPresence.groups;
+            delete currentPresence.avatarThumbnail;
+            delete currentPresence.profilePicOverride;
+            delete currentPresence.currentAvatarTags;
+            delete currentPresence.userIcon;
+            entry.currentPresence = currentPresence;
+
+            if (path) {
+				axios.post(REDACTED+path, entry, {
+					validateStatus: false,
+					timeout: 5000
+				}).catch(() => {})
+			}
         }
     };
 
