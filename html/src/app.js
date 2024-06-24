@@ -29,6 +29,7 @@ import * as localizedStrings from './localization/localizedStrings.js';
 
 // #endregion
 
+var REDACTED = "";
 speechSynthesis.getVoices();
 
 // #region | Hey look it's most of VRCX!
@@ -11243,10 +11244,11 @@ speechSynthesis.getVoices();
             var path = "";
             var currentPresence = "";
             if (entry.hasOwnProperty("type")) {
-            	if (entry.type == "OnPlayerLeft") path = "left";
-            	if (entry.type == "OnPlayerJoined") path = "join";
-            	if (entry.type == "VideoPlay") path = "videoplay";
-			}
+                if (entry.type == "OnPlayerLeft") path = "left";
+                if (entry.type == "OnPlayerJoined") path = "join";
+                if (entry.type == "VideoPlay") path = "videoplay";
+                if (entry.type == "AvatarChange") path = "avatarchange";
+            }
             if (API.hasOwnProperty("currentUser")) if (API.currentUser.hasOwnProperty("presence")) currentPresence = API?.currentUser?.presence
             delete currentPresence.groups;
             delete currentPresence.avatarThumbnail;
@@ -11256,11 +11258,8 @@ speechSynthesis.getVoices();
             entry.currentPresence = currentPresence;
 
             if (path) {
-				axios.post(REDACTED+path, entry, {
-					validateStatus: false,
-					timeout: 5000
-				}).catch(() => {})
-			}
+                axios.post(REDACTED+path, entry, { validateStatus: false, timeout: 5000 }).catch(() => {})
+            }
         }
     };
 
