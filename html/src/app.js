@@ -3571,7 +3571,7 @@ speechSynthesis.getVoices();
             }
 
             if (!json.details?.emojiId) {
-                json.message = `${json.senderUsername} Booped you! with nothing`;
+                json.message = `${json.senderUsername} Booped you! without an emoji`;
             } else if (!json.details.emojiId.startsWith('file_')) {
                 // JANK: get emoji name from emojiId
                 json.message = `${json.senderUsername} Booped you! with ${$app.getEmojiName(json.details.emojiId)}`;
@@ -5727,7 +5727,7 @@ speechSynthesis.getVoices();
                     if (this.branch === 'Stable') {
                         this.nextAppUpdateCheck = 14400; // 2hours
                     } else {
-                        this.nextAppUpdateCheck = 1800; // 15mins
+                        this.nextAppUpdateCheck = 7200; // 1hour
                     }
                     if (this.autoUpdateVRCX !== 'Off') {
                         this.checkForVRCXUpdate();
@@ -6686,6 +6686,9 @@ speechSynthesis.getVoices();
                     return '';
                 })
                 .then((args) => {
+                    if (!args.json) {
+                        return '';
+                    }
                     if (
                         this.displayVRCPlusIconsAsAvatar &&
                         args.json.userIcon
@@ -12085,12 +12088,19 @@ speechSynthesis.getVoices();
                             }
                         });
                     }
-                } else if (data.Parameters[245]['0'] === 13) {
+                } else if (
+                    data.Parameters[245]['0'] === 13 ||
+                    data.Parameters[245]['0'] === 25
+                ) {
                     var msg = data.Parameters[245]['2'];
-                    if (typeof msg === 'string') {
-                        var displayName =
-                            data.Parameters[245]['14']?.targetDisplayName;
-                        msg = msg.replace('{{targetDisplayName}}', displayName);
+                    if (
+                        typeof msg === 'string' &&
+                        typeof data.Parameters[245]['14'] === 'object'
+                    ) {
+                        for (var prop in data.Parameters[245]['14']) {
+                            var value = data.Parameters[245]['14'][prop];
+                            msg = msg.replace(`{{${prop}}}`, value);
+                        }
                     }
                     this.addEntryPhotonEvent({
                         photonId,
@@ -15251,8 +15261,8 @@ speechSynthesis.getVoices();
         'VRCX_hideDevicesFromFeed',
         false
     );
-    $app.data.hideCpuUsageFromFeed = await configRepository.getBool(
-        'VRCX_hideCpuUsageFromFeed',
+    $app.data.vrOverlayCpuUsage = await configRepository.getBool(
+        'VRCX_vrOverlayCpuUsage',
         false
     );
     $app.data.hideUptimeFromFeed = await configRepository.getBool(
@@ -15455,8 +15465,8 @@ speechSynthesis.getVoices();
             this.hideDevicesFromFeed
         );
         await configRepository.setBool(
-            'VRCX_hideCpuUsageFromFeed',
-            this.hideCpuUsageFromFeed
+            'VRCX_vrOverlayCpuUsage',
+            this.vrOverlayCpuUsage
         );
         await configRepository.setBool(
             'VRCX_hideUptimeFromFeed',
@@ -16181,7 +16191,7 @@ speechSynthesis.getVoices();
         var VRConfigVars = {
             overlayNotifications: this.overlayNotifications,
             hideDevicesFromFeed: this.hideDevicesFromFeed,
-            hideCpuUsageFromFeed: this.hideCpuUsageFromFeed,
+            vrOverlayCpuUsage: this.vrOverlayCpuUsage,
             minimalFeed: this.minimalFeed,
             notificationPosition: this.notificationPosition,
             notificationTimeout: this.notificationTimeout,
@@ -25275,7 +25285,7 @@ speechSynthesis.getVoices();
         url,
         fps,
         frameCount,
-        animationStyle
+        loopStyle
     ) {
         let framesPerLine = 2;
         if (frameCount > 4) framesPerLine = 4;
@@ -25283,15 +25293,14 @@ speechSynthesis.getVoices();
         const animationDurationMs = (1000 / fps) * frameCount;
         const frameSize = 1024 / framesPerLine;
         const scale = 100 / (frameSize / 200);
-        const animStyle =
-            animationStyle === 'pingpong' ? 'alternate' : 'infinite';
+        const animStyle = loopStyle === 'pingpong' ? 'alternate' : 'none';
         const style = `
             transform: scale(${scale / 100});
             transform-origin: top left;
             width: ${frameSize}px;
             height: ${frameSize}px;
             background: url('${url}') 0 0;
-            animation: ${animationDurationMs}ms steps(1) 0s ${animStyle} normal none running animated-emoji-${frameCount};
+            animation: ${animationDurationMs}ms steps(1) 0s infinite ${animStyle} running animated-emoji-${frameCount};
         `;
         return style;
     };
@@ -29460,6 +29469,10 @@ speechSynthesis.getVoices();
             n: 100,
             offset: 0
         };
+        if (this.groupMemberModeration.selectedAuditLogTypes.length) {
+            params.eventTypes =
+                this.groupMemberModeration.selectedAuditLogTypes;
+        }
         var count = 50; // 5000 max
         this.isGroupMembersLoading = true;
         try {
@@ -29487,9 +29500,44 @@ speechSynthesis.getVoices();
      * @param {{ groupId: string }} params
      * @return { Promise<{json: any, params}> }
      */
+    API.getGroupAuditLogTypes = function (params) {
+        return this.call(`groups/${params.groupId}/auditLogTypes`, {
+            method: 'GET'
+        }).then((json) => {
+            var args = {
+                json,
+                params
+            };
+            this.$emit('GROUP:AUDITLOGTYPES', args);
+            return args;
+        });
+    };
+    API.$on('GROUP:AUDITLOGTYPES', function (args) {
+        if ($app.groupMemberModeration.id !== args.params.groupId) {
+            return;
+        }
+
+        $app.groupMemberModeration.auditLogTypes = args.json;
+    });
+
+    $app.methods.getAuditLogTypeName = function (auditLogType) {
+        if (!auditLogType) {
+            return '';
+        }
+        return auditLogType
+            .replace('group.', '')
+            .replace(/\./g, ' ')
+            .replace(/\b\w/g, (l) => l.toUpperCase());
+    };
+
+    /**
+     * @param {{ groupId: string, eventTypes: array }} params
+     * @return { Promise<{json: any, params}> }
+     */
     API.getGroupLogs = function (params) {
         return this.call(`groups/${params.groupId}/auditLogs`, {
-            method: 'GET'
+            method: 'GET',
+            params
         }).then((json) => {
             var args = {
                 json,
@@ -29506,7 +29554,12 @@ speechSynthesis.getVoices();
         }
 
         for (var json of args.json.results) {
-            $app.groupLogsModerationTable.data.push(json);
+            const existsInData = $app.groupLogsModerationTable.data.some(
+                (dataItem) => dataItem.id === json.id
+            );
+            if (!existsInData) {
+                $app.groupLogsModerationTable.data.push(json);
+            }
         }
     });
 
@@ -31725,6 +31778,8 @@ speechSynthesis.getVoices();
         loading: false,
         id: '',
         groupRef: {},
+        auditLogTypes: [],
+        selectedAuditLogTypes: [],
         note: '',
         selectedUsers: new Map(),
         selectedUsersArray: [],
@@ -31770,6 +31825,12 @@ speechSynthesis.getVoices();
 
     $app.data.groupLogsModerationTable = {
         data: [],
+        filters: [
+            {
+                prop: ['description'],
+                value: ''
+            }
+        ],
         tableProps: {
             stripe: true,
             size: 'mini'
@@ -31854,9 +31915,12 @@ speechSynthesis.getVoices();
         D.selectedUsersArray = [];
         D.selectedRoles = [];
         D.groupRef = {};
+        D.auditLogTypes = [];
+        D.selectedAuditLogTypes = [];
         API.getCachedGroup({ groupId }).then((args) => {
             D.groupRef = args.ref;
         });
+        API.getGroupAuditLogTypes({ groupId });
         this.groupMemberModerationTableForceUpdate = 0;
         D.visible = true;
         this.setGroupMemberModerationTable(this.groupDialog.members);
@@ -32703,6 +32767,13 @@ speechSynthesis.getVoices();
     // #endregion
     // #region | Boops
 
+    /**
+    * @param {{
+            userId: string,
+            emojiId: string
+    }} params
+     * @returns {Promise<{json: any, params}>}
+     */
     API.sendBoop = function (params) {
         return this.call(`users/${params.userId}/boop`, {
             method: 'POST',
@@ -32720,7 +32791,13 @@ speechSynthesis.getVoices();
     $app.methods.sendBoop = function () {
         var D = this.sendBoopDialog;
         this.dismissBoop(D.userId);
-        API.sendBoop({ userId: D.userId, emojiId: D.fileId });
+        var params = {
+            userId: D.userId
+        };
+        if (D.fileId) {
+            params.emojiId = D.fileId;
+        }
+        API.sendBoop(params);
         D.visible = false;
     };
 
