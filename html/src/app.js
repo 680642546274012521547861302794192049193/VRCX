@@ -26,6 +26,9 @@ import gameLogService from './service/gamelog.js';
 import security from './security.js';
 import database from './repository/database.js';
 import * as localizedStrings from './localization/localizedStrings.js';
+import removeConfusables, {
+    removeWhitespace
+} from './libsAndLolisAndSugoiLibs/confusables.js';
 
 // #endregion
 
@@ -302,7 +305,7 @@ speechSynthesis.getVoices();
         ltz: 'lb',
         mar: 'hi',
         mkd: 'mk',
-        msa: 'id',
+        msa: 'my',
         sco: 'gd',
         slk: 'sk',
         slv: 'sl',
@@ -376,6 +379,7 @@ speechSynthesis.getVoices();
     API.websocketDomainVrchat = 'wss://pipeline.vrchat.cloud';
     API.endpointDomain = 'https://api.vrchat.cloud/api/1';
     API.websocketDomain = 'wss://pipeline.vrchat.cloud';
+    API.attemptingAutoLogin = false;
 
     API.call = function (endpoint, options) {
         var init = {
@@ -434,6 +438,9 @@ speechSynthesis.getVoices();
                 this.$throw(0, err, endpoint);
             })
             .then((response) => {
+                if (!response.data) {
+                    return response;
+                }
                 try {
                     response.data = JSON.parse(response.data);
                     if ($app.debugWebRequests) {
@@ -485,12 +492,21 @@ speechSynthesis.getVoices();
                     status === 401 &&
                     data.error.message === '"Missing Credentials"'
                 ) {
-                    if (endpoint === 'auth/user') {
-                        this.$emit('AUTOLOGIN');
-                    }
+                    this.$emit('AUTOLOGIN');
                     throw new Error('401: Missing Credentials');
                 }
-                if (status === 403 && endpoint.substring(0, 6) === 'config') {
+                if (
+                    status === 401 &&
+                    data.error.message === '"Unauthorized"' &&
+                    endpoint !== 'auth/user'
+                ) {
+                    // trigger 2FA dialog
+                    if (!$app.twoFactorAuthDialogVisible) {
+                        $app.API.getCurrentUser();
+                    }
+                    throw new Error('401: Unauthorized');
+                }
+                if (status === 403 && endpoint === 'config') {
                     $app.$alert(
                         'VRChat currently blocks most VPNs. Please disable any connected VPNs and try again.',
                         'Login Error 403'
@@ -498,13 +514,20 @@ speechSynthesis.getVoices();
                     this.logout();
                     throw new Error(`403: ${endpoint}`);
                 }
-                if (status === 404 && endpoint.substring(0, 8) === 'avatars/') {
+                if (
+                    init.method === 'GET' &&
+                    status === 404 &&
+                    endpoint.startsWith('avatars/')
+                ) {
                     $app.$message({
                         message: 'Avatar private or deleted',
                         type: 'error'
                     });
                     $app.avatarDialog.visible = false;
                     throw new Error(`404: ${data.error.message} ${endpoint}`);
+                }
+                if (status === 404 && endpoint.endsWith('/persist/exists')) {
+                    return false;
                 }
                 if (
                     init.method === 'GET' &&
@@ -513,7 +536,12 @@ speechSynthesis.getVoices();
                 ) {
                     this.failedGetRequests.set(endpoint, Date.now());
                 }
-                if (status === 404 && endpoint.startsWith('users/')) {
+                if (
+                    init.method === 'GET' &&
+                    status === 404 &&
+                    endpoint.startsWith('users/') &&
+                    endpoint.split('/').length - 1 === 1
+                ) {
                     throw new Error(`404: ${data.error.message} ${endpoint}`);
                 }
                 if (
@@ -746,7 +774,7 @@ speechSynthesis.getVoices();
             canRequestInvite: false,
             strict: false
         };
-        if (_tag === 'offline') {
+        if (_tag === 'offline' || _tag === 'offline:offline') {
             ctx.isOffline = true;
         } else if (_tag === 'private') {
             ctx.isPrivate = true;
@@ -994,10 +1022,14 @@ speechSynthesis.getVoices();
                 }
             },
             showGroupDialog() {
-                if (!this.location || !this.link) {
+                var location = this.location;
+                if (this.isTraveling) {
+                    location = this.traveling;
+                }
+                if (!location || !this.link) {
                     return;
                 }
-                var L = API.parseLocation(this.location);
+                var L = API.parseLocation(location);
                 if (!L.groupId) {
                     return;
                 }
@@ -1103,6 +1135,43 @@ speechSynthesis.getVoices();
         }
     });
 
+    Vue.component('last-join', {
+        template:
+            '<span>' +
+            '<el-tooltip placement="top" style="margin-left:5px" v-if="lastJoin">' +
+            '<div slot="content">' +
+            '<span>{{ $t("dialog.user.info.last_join") }} <timer :epoch="lastJoin"></timer></span>' +
+            '</div>' +
+            '<i v-if="lastJoin" class="el-icon el-icon-location-outline" style="display:inline-block"></i>' +
+            '</el-tooltip>' +
+            '</span>',
+        props: {
+            location: String,
+            currentlocation: String
+        },
+        data() {
+            return {
+                lastJoin: this.lastJoin
+            };
+        },
+        methods: {
+            parse() {
+                this.lastJoin = $app.instanceJoinHistory.get(this.location);
+            }
+        },
+        watch: {
+            location() {
+                this.parse();
+            },
+            currentlocation() {
+                this.parse();
+            }
+        },
+        created() {
+            this.parse();
+        }
+    });
+
     Vue.component('instance-info', {
         template:
             '<div style="display:inline-block;margin-left:5px">' +
@@ -1180,7 +1249,7 @@ speechSynthesis.getVoices();
                     this.closedAt = this.instance.closedAt;
                 }
                 this.isHardClosed = this.instance.hardClose === true;
-                this.occupants = this.instance.n_users;
+                this.occupants = this.instance.userCount;
                 if (this.location === $app.lastLocation.location) {
                     // use gameLog for occupants when in same location
                     this.occupants = $app.lastLocation.playerList.size;
@@ -1391,7 +1460,9 @@ speechSynthesis.getVoices();
 
     API.isLoggedIn = false;
     API.cachedUsers = new Map();
-    API.currentUser = {};
+    API.currentUser = {
+        $userColour: ''
+    };
     API.currentTravelers = new Map();
 
     API.$on('USER:CURRENT', function (args) {
@@ -1871,6 +1942,7 @@ speechSynthesis.getVoices();
     };
 
     API.getCurrentUser = function () {
+        $app.nextCurrentUserRefresh = 840; // 7mins
         return this.call('auth/user', {
             method: 'GET'
         }).then((json) => {
@@ -1971,6 +2043,7 @@ speechSynthesis.getVoices();
                 $online_for: Date.now(),
                 $travelingToTime: Date.now(),
                 $offline_for: '',
+                $active_for: Date.now(),
                 $isVRCPlus: false,
                 $isModerator: false,
                 $isTroll: false,
@@ -2724,10 +2797,10 @@ speechSynthesis.getVoices();
                 hasCapacityForYou: true, // not present depending on endpoint
                 capacity: 0,
                 recommendedCapacity: 0,
-                userCount: 0, // PC only?
+                userCount: 0,
                 queueEnabled: false, // only present with group instance type
                 queueSize: 0, // only present when queuing is enabled
-                platforms: [],
+                platforms: {},
                 gameServerVersion: 0,
                 hardClose: null, // boolean or null
                 closedAt: null, // string or null
@@ -2740,8 +2813,15 @@ speechSynthesis.getVoices();
                 region: '',
                 canRequestInvite: false,
                 permanent: false,
-                private: '',
-                strict: false,
+                private: '', // part of instance tag
+                hidden: '', // part of instance tag
+                nonce: '', // only present when you're the owner
+                strict: false, // deprecated
+                displayName: null,
+                groupAccessType: null, // only present with group instance type
+                roleRestricted: false, // only present with group instance type
+                instancePersistenceEnabled: null,
+                playerPersistenceEnabled: null,
                 // VRCX
                 $fetchedAt: '',
                 ...json
@@ -2846,20 +2926,27 @@ speechSynthesis.getVoices();
             this.currentUser.onlineFriends.length +
             this.currentUser.activeFriends.length;
         var count = Math.trunc(N / 50);
-        for (var i = count; i > -1; i--) {
+        mainLoop: for (var i = count; i > -1; i--) {
             if (params.offset > 5000) {
                 // API offset limit is 5000
                 break;
             }
-            for (var j = 0; j < 10; j++) {
+            retryLoop: for (var j = 0; j < 10; j++) {
                 // handle 429 ratelimit error, retry 10 times
                 try {
                     var args = await this.getFriends(params);
                     friends = friends.concat(args.json);
-                    params.offset += 50;
-                    break;
+                    break retryLoop;
                 } catch (err) {
                     console.error(err);
+                    if (!API.currentUser.isLoggedIn) {
+                        console.error(`User isn't logged in`);
+                        break mainLoop;
+                    }
+                    if (err?.message?.includes('Not Found')) {
+                        console.error('Awful workaround for awful VRC API bug');
+                        break retryLoop;
+                    }
                     if (j === 9) {
                         throw err;
                     }
@@ -2868,6 +2955,7 @@ speechSynthesis.getVoices();
                     });
                 }
             }
+            params.offset += 50;
         }
         return friends;
     };
@@ -2884,20 +2972,23 @@ speechSynthesis.getVoices();
             this.currentUser.activeFriends.length;
         var N = this.currentUser.friends.length - onlineCount;
         var count = Math.trunc(N / 50);
-        for (var i = count; i > -1; i--) {
+        mainLoop: for (var i = count; i > -1; i--) {
             if (params.offset > 5000) {
                 // API offset limit is 5000
                 break;
             }
-            for (var j = 0; j < 10; j++) {
+            retryLoop: for (var j = 0; j < 10; j++) {
                 // handle 429 ratelimit error, retry 10 times
                 try {
                     var args = await this.getFriends(params);
                     friends = friends.concat(args.json);
-                    params.offset += 50;
-                    break;
+                    break retryLoop;
                 } catch (err) {
                     console.error(err);
+                    if (err?.message?.includes('Not Found')) {
+                        console.error('Awful workaround for awful VRC API bug');
+                        break retryLoop;
+                    }
                     if (j === 9) {
                         throw err;
                     }
@@ -2906,6 +2997,7 @@ speechSynthesis.getVoices();
                     });
                 }
             }
+            params.offset += 50;
         }
         return friends;
     };
@@ -3829,10 +3921,12 @@ speechSynthesis.getVoices();
     // #region | API: PlayerModeration
 
     API.cachedPlayerModerations = new Map();
+    API.cachedPlayerModerationsUserIds = new Set();
     API.isPlayerModerationsLoading = false;
 
     API.$on('LOGIN', function () {
         this.cachedPlayerModerations.clear();
+        this.cachedPlayerModerationsUserIds.clear();
         this.isPlayerModerationsLoading = false;
         this.refreshPlayerModerations();
     });
@@ -3868,12 +3962,11 @@ speechSynthesis.getVoices();
         var userId = this.currentUser.id;
         for (var ref of this.cachedPlayerModerations.values()) {
             if (
-                ref.$isDeleted === false &&
                 ref.type === type &&
                 ref.targetUserId === moderated &&
                 ref.sourceUserId === userId
             ) {
-                ref.$isDeleted = true;
+                this.cachedPlayerModerations.delete(ref.id);
                 this.$emit('PLAYER-MODERATION:@DELETE', {
                     ref,
                     params: {
@@ -3882,6 +3975,7 @@ speechSynthesis.getVoices();
                 });
             }
         }
+        this.cachedPlayerModerationsUserIds.delete(moderated);
     });
 
     API.applyPlayerModeration = function (json) {
@@ -3896,7 +3990,6 @@ speechSynthesis.getVoices();
                 targetDisplayName: '',
                 created: '',
                 // VRCX
-                $isDeleted: false,
                 $isExpired: false,
                 //
                 ...json
@@ -3906,10 +3999,14 @@ speechSynthesis.getVoices();
             Object.assign(ref, json);
             ref.$isExpired = false;
         }
+        if (json.targetUserId) {
+            this.cachedPlayerModerationsUserIds.add(json.targetUserId);
+        }
         return ref;
     };
 
     API.expirePlayerModerations = function () {
+        this.cachedPlayerModerationsUserIds.clear();
         for (var ref of this.cachedPlayerModerations.values()) {
             ref.$isExpired = true;
         }
@@ -3917,10 +4014,9 @@ speechSynthesis.getVoices();
 
     API.deleteExpiredPlayerModerations = function () {
         for (var ref of this.cachedPlayerModerations.values()) {
-            if (ref.$isDeleted || ref.$isExpired === false) {
+            if (!ref.$isExpired) {
                 continue;
             }
-            ref.$isDeleted = true;
             this.$emit('PLAYER-MODERATION:@DELETE', {
                 ref,
                 params: {
@@ -4197,6 +4293,15 @@ speechSynthesis.getVoices();
             !API.cachedAvatars.has(args.params.favoriteId)
         ) {
             this.refreshFavoriteAvatars(args.params.tags);
+        }
+
+        if (
+            args.params.type === 'friend' &&
+            $app.localFavoriteFriendsGroups.includes(
+                'friend:' + args.params.tags
+            )
+        ) {
+            $app.updateLocalFavoriteFriends();
         }
     });
 
@@ -4997,7 +5102,8 @@ speechSynthesis.getVoices();
                         json: {
                             location: content.location,
                             travelingToLocation: content.travelingToLocation,
-                            ...content.user
+                            ...content.user,
+                            state: 'online'
                         },
                         params: {
                             userId: content.userId
@@ -5017,7 +5123,10 @@ speechSynthesis.getVoices();
             case 'friend-active':
                 if (content?.user?.id) {
                     this.$emit('USER', {
-                        json: content.user,
+                        json: {
+                            ...content.user,
+                            state: 'active'
+                        },
                         params: {
                             userId: content.userId
                         }
@@ -5074,7 +5183,8 @@ speechSynthesis.getVoices();
                     json: {
                         location: content.location,
                         travelingToLocation: content.travelingToLocation,
-                        ...content.user
+                        ...content.user,
+                        state: 'online'
                     },
                     params: {
                         userId: content.userId
@@ -5179,8 +5289,16 @@ speechSynthesis.getVoices();
                 $app.instanceQueueReady(instanceId);
                 break;
 
+            case 'instance-queue-left':
+                console.log('instance-queue-left', content);
+                var instanceId = content.instanceLocation;
+                $app.removeQueuedInstance(instanceId);
+                // $app.instanceQueueClear();
+                break;
+
             case 'content-refresh':
                 var contentType = content.contentType;
+                console.log('content-refresh', content);
                 if (contentType === 'icon') {
                     if ($app.galleryDialogVisible) {
                         $app.refreshVRCPlusIconsTable();
@@ -5193,10 +5311,16 @@ speechSynthesis.getVoices();
                     if ($app.galleryDialogVisible) {
                         $app.refreshEmojiTable();
                     }
+                } else if (contentType === 'sticker') {
+                    if ($app.galleryDialogVisible) {
+                        $app.refreshStickerTable();
+                    }
                 } else if (contentType === 'avatar') {
                     // hmm, utilizing this might be too spamy and cause UI to move around
                 } else if (contentType === 'world') {
                     // hmm
+                } else if (contentType === 'created') {
+                    // on avatar upload
                 } else {
                     console.log('Unknown content-refresh', content);
                 }
@@ -5256,6 +5380,15 @@ speechSynthesis.getVoices();
                 if ($app.debugWebSocket) {
                     console.log('WebSocket closed');
                 }
+                workerTimers.setTimeout(() => {
+                    if (
+                        this.isLoggedIn &&
+                        $app.friendLogInitStatus &&
+                        this.webSocket === null
+                    ) {
+                        this.getAuth();
+                    }
+                }, 5000);
             };
             socket.onerror = () => {
                 if (this.errorNoty) {
@@ -5313,6 +5446,14 @@ speechSynthesis.getVoices();
         } catch (err) {}
     };
 
+    API.reconnectWebSocket = function () {
+        if (!this.isLoggedIn || !$app.friendLogInitStatus) {
+            return;
+        }
+        this.closeWebSocket();
+        this.getAuth();
+    };
+
     // #endregion
     // #region | API: Visit
 
@@ -5342,6 +5483,22 @@ speechSynthesis.getVoices();
     var extractFileVersion = (s) => {
         var match = /(?:\/file_[0-9A-Za-z-]+\/)([0-9]+)/gi.exec(s);
         return match ? match[1] : '';
+    };
+
+    var extractVariantVersion = (url) => {
+        if (!url) {
+            return '0';
+        }
+        try {
+            const params = new URLSearchParams(new URL(url).search);
+            const version = params.get('v');
+            if (version) {
+                return version;
+            }
+            return '0';
+        } catch {
+            return '0';
+        }
     };
 
     var buildTreeData = (json) => {
@@ -5581,6 +5738,14 @@ speechSynthesis.getVoices();
                     (await configRepository.getString('lastUserLoggedIn')) !==
                         null
                 ) {
+                    var user =
+                        this.loginForm.savedCredentials[
+                            this.loginForm.lastUserLoggedIn
+                        ];
+                    if (user?.loginParmas?.endpoint) {
+                        API.endpointDomain = user.loginParmas.endpoint;
+                        API.websocketDomain = user.loginParmas.websocket;
+                    }
                     // login at startup
                     this.loginForm.loading = true;
                     API.getConfig()
@@ -5589,9 +5754,14 @@ speechSynthesis.getVoices();
                             throw err;
                         })
                         .then((args) => {
-                            API.getCurrentUser().finally(() => {
-                                this.loginForm.loading = false;
-                            });
+                            API.getCurrentUser()
+                                .finally(() => {
+                                    this.loginForm.loading = false;
+                                })
+                                .catch((err) => {
+                                    this.nextCurrentUserRefresh = 120; // 1min
+                                    console.error(err);
+                                });
                             return args;
                         });
                 } else {
@@ -5704,7 +5874,6 @@ speechSynthesis.getVoices();
             if (API.isLoggedIn === true) {
                 if (--this.nextFriendsRefresh <= 0) {
                     this.nextFriendsRefresh = 7200; // 1hour
-                    this.nextCurrentUserRefresh = 60; // 30secs
                     this.refreshFriendsList();
                     this.updateStoredUser(API.currentUser);
                     if (this.isGameRunning) {
@@ -5712,24 +5881,17 @@ speechSynthesis.getVoices();
                     }
                 }
                 if (--this.nextCurrentUserRefresh <= 0) {
-                    this.nextCurrentUserRefresh = 60; // 30secs
-                    API.getCurrentUser().catch((err1) => {
-                        throw err1;
-                    });
-                    AppApi.CheckGameRunning();
+                    API.getCurrentUser();
                 }
                 if (--this.nextGroupInstanceRefresh <= 0) {
                     if (this.friendLogInitStatus) {
                         this.nextGroupInstanceRefresh = 600; // 5min
                         API.getUsersGroupInstances();
                     }
+                    AppApi.CheckGameRunning();
                 }
                 if (--this.nextAppUpdateCheck <= 0) {
-                    if (this.branch === 'Stable') {
-                        this.nextAppUpdateCheck = 14400; // 2hours
-                    } else {
-                        this.nextAppUpdateCheck = 7200; // 1hour
-                    }
+                    this.nextAppUpdateCheck = 7200; // 1hour
                     if (this.autoUpdateVRCX !== 'Off') {
                         this.checkForVRCXUpdate();
                     }
@@ -6550,11 +6712,8 @@ speechSynthesis.getVoices();
         var playDesktopToast = false;
         if (
             this.desktopToast === 'Always' ||
-            (this.desktopToast === 'Outside VR' &&
-                (this.isGameNoVR || !this.isGameRunning)) ||
-            (this.desktopToast === 'Inside VR' &&
-                !this.isGameNoVR &&
-                this.isGameRunning) ||
+            (this.desktopToast === 'Outside VR' && !this.isSteamVRRunning) ||
+            (this.desktopToast === 'Inside VR' && this.isSteamVRRunning) ||
             (this.desktopToast === 'Game Closed' && !this.isGameRunning) ||
             (this.desktopToast === 'Game Running' && this.isGameRunning) ||
             (this.desktopToast === 'Desktop Mode' &&
@@ -7983,6 +8142,24 @@ speechSynthesis.getVoices();
         if (index === 'notification') {
             this.unseenNotifications = [];
         }
+
+        workerTimers.setTimeout(() => {
+            // fix some weird sorting bug when disabling data tables
+            if (
+                typeof this.$refs.playerModerationTableRef?.sortData !==
+                'undefined'
+            ) {
+                this.$refs.playerModerationTableRef.sortData.prop = 'created';
+            }
+            if (
+                typeof this.$refs.notificationTableRef?.sortData !== 'undefined'
+            ) {
+                this.$refs.notificationTableRef.sortData.prop = 'created_at';
+            }
+            if (typeof this.$refs.friendLogTableRef?.sortData !== 'undefined') {
+                this.$refs.friendLogTableRef.sortData.prop = 'created_at';
+            }
+        }, 100);
     };
 
     $app.data.twoFactorAuthDialogVisible = false;
@@ -8236,6 +8413,7 @@ speechSynthesis.getVoices();
             }).show();
         }
         this.isLoggedIn = false;
+        $app.friendLogInitStatus = false;
     });
 
     API.$on('LOGIN', function (args) {
@@ -8523,30 +8701,58 @@ speechSynthesis.getVoices();
     };
 
     API.$on('AUTOLOGIN', function () {
+        if (this.attemptingAutoLogin) {
+            return;
+        }
+        this.attemptingAutoLogin = true;
         var user =
             $app.loginForm.savedCredentials[$app.loginForm.lastUserLoggedIn];
-        if (typeof user !== 'undefined') {
-            if ($app.enablePrimaryPassword) {
-                this.logout();
-            } else {
-                $app.relogin(user).then(() => {
-                    if (this.errorNoty) {
-                        this.errorNoty.close();
-                    }
-                    if (!navigator.onLine) {
-                        this.errorNoty = new Noty({
-                            type: 'error',
-                            text: 'You are offline.'
-                        }).show();
-                    } else {
-                        this.errorNoty = new Noty({
-                            type: 'success',
-                            text: 'Automatically logged in.'
-                        }).show();
-                    }
-                });
-            }
+        if (typeof user === 'undefined') {
+            this.attemptingAutoLogin = false;
+            return;
         }
+        if ($app.enablePrimaryPassword) {
+            this.logout();
+            return;
+        }
+        $app.relogin(user)
+            .then(() => {
+                if (this.errorNoty) {
+                    this.errorNoty.close();
+                }
+                this.errorNoty = new Noty({
+                    type: 'success',
+                    text: 'Automatically logged in.'
+                }).show();
+                console.log('Automatically logged in.');
+            })
+            .catch((err) => {
+                if (this.errorNoty) {
+                    this.errorNoty.close();
+                }
+                this.errorNoty = new Noty({
+                    type: 'error',
+                    text: 'Failed to login automatically.'
+                }).show();
+                console.error('Failed to login automatically.', err);
+            })
+            .finally(() => {
+                if (!navigator.onLine) {
+                    this.errorNoty = new Noty({
+                        type: 'error',
+                        text: `You're offline.`
+                    }).show();
+                    console.error(`You're offline.`);
+                }
+            });
+    });
+
+    API.$on('USER:CURRENT', function () {
+        this.attemptingAutoLogin = false;
+    });
+
+    API.$on('LOGOUT', function () {
+        this.attemptingAutoLogin = false;
     });
 
     $app.data.loginForm = {
@@ -8847,24 +9053,20 @@ speechSynthesis.getVoices();
     $app.data.pendingActiveFriends = new Set();
     $app.data.friendsNo = 0;
     $app.data.isFriendsGroupMe = true;
-    $app.data.isFriendsGroup0 = true;
-    $app.data.isFriendsGroup1 = true;
-    $app.data.isFriendsGroup2 = true;
-    $app.data.isFriendsGroup3 = false;
+    $app.data.isVIPFriends = true;
+    $app.data.isOnlineFriends = true;
+    $app.data.isActiveFriends = true;
+    $app.data.isOfflineFriends = false;
     $app.data.isGroupInstances = false;
     $app.data.groupInstances = [];
-    $app.data.friendsGroup0_ = [];
-    $app.data.friendsGroup1_ = [];
-    $app.data.friendsGroup2_ = [];
-    $app.data.friendsGroup3_ = [];
-    $app.data.friendsGroupA_ = [];
-    $app.data.friendsGroupB_ = [];
-    $app.data.friendsGroupC_ = [];
-    $app.data.friendsGroupD_ = [];
-    $app.data.sortFriendsGroup0 = false;
-    $app.data.sortFriendsGroup1 = false;
-    $app.data.sortFriendsGroup2 = false;
-    $app.data.sortFriendsGroup3 = false;
+    $app.data.vipFriends_ = [];
+    $app.data.onlineFriends_ = [];
+    $app.data.activeFriends_ = [];
+    $app.data.offlineFriends_ = [];
+    $app.data.sortVIPFriends = false;
+    $app.data.sortOnlineFriends = false;
+    $app.data.sortActiveFriends = false;
+    $app.data.sortOfflineFriends = false;
 
     $app.methods.saveFriendsGroupStates = async function () {
         await configRepository.setBool(
@@ -8873,19 +9075,19 @@ speechSynthesis.getVoices();
         );
         await configRepository.setBool(
             'VRCX_isFriendsGroupFavorites',
-            this.isFriendsGroup0
+            this.isVIPFriends
         );
         await configRepository.setBool(
             'VRCX_isFriendsGroupOnline',
-            this.isFriendsGroup1
+            this.isOnlineFriends
         );
         await configRepository.setBool(
             'VRCX_isFriendsGroupActive',
-            this.isFriendsGroup2
+            this.isActiveFriends
         );
         await configRepository.setBool(
             'VRCX_isFriendsGroupOffline',
-            this.isFriendsGroup3
+            this.isOfflineFriends
         );
     };
 
@@ -8894,19 +9096,19 @@ speechSynthesis.getVoices();
             'VRCX_isFriendsGroupMe',
             true
         );
-        this.isFriendsGroup0 = await configRepository.getBool(
+        this.isVIPFriends = await configRepository.getBool(
             'VRCX_isFriendsGroupFavorites',
             true
         );
-        this.isFriendsGroup1 = await configRepository.getBool(
+        this.isOnlineFriends = await configRepository.getBool(
             'VRCX_isFriendsGroupOnline',
             true
         );
-        this.isFriendsGroup2 = await configRepository.getBool(
+        this.isActiveFriends = await configRepository.getBool(
             'VRCX_isFriendsGroupActive',
             false
         );
-        this.isFriendsGroup3 = await configRepository.getBool(
+        this.isOfflineFriends = await configRepository.getBool(
             'VRCX_isFriendsGroupOffline',
             false
         );
@@ -8957,28 +9159,30 @@ speechSynthesis.getVoices();
         $app.friends.clear();
         $app.pendingActiveFriends.clear();
         $app.friendsNo = 0;
-        $app.isFriendsGroup0 = true;
-        $app.isFriendsGroup1 = true;
-        $app.isFriendsGroup2 = true;
-        $app.isFriendsGroup3 = false;
-        $app.friendsGroup0_ = [];
-        $app.friendsGroup1_ = [];
-        $app.friendsGroup2_ = [];
-        $app.friendsGroup3_ = [];
-        $app.friendsGroupA_ = [];
-        $app.friendsGroupB_ = [];
-        $app.friendsGroupC_ = [];
-        $app.friendsGroupD_ = [];
-        $app.sortFriendsGroup0 = false;
-        $app.sortFriendsGroup1 = false;
-        $app.sortFriendsGroup2 = false;
-        $app.sortFriendsGroup3 = false;
+        $app.isVIPFriends = true;
+        $app.isOnlineFriends = true;
+        $app.isActiveFriends = true;
+        $app.isOfflineFriends = false;
+        $app.vipFriends_ = [];
+        $app.onlineFriends_ = [];
+        $app.activeFriends_ = [];
+        $app.offlineFriends_ = [];
+        $app.sortVIPFriends = false;
+        $app.sortOnlineFriends = false;
+        $app.sortActiveFriends = false;
+        $app.sortOfflineFriends = false;
     });
 
     API.$on('USER:CURRENT', function (args) {
         // USER:CURRENT에서 처리를 함
         $app.refreshFriends(args.ref, args.origin);
         $app.updateOnlineFriendCoutner();
+
+        if ($app.randomUserColours) {
+            $app.getNameColour(this.currentUser.id).then((colour) => {
+                this.currentUser.$userColour = colour;
+            });
+        }
     });
 
     API.$on('FRIEND:ADD', function (args) {
@@ -9009,12 +9213,16 @@ speechSynthesis.getVoices();
     });
 
     $app.methods.refreshFriendsList = async function () {
-        await API.getCurrentUser();
-        this.nextCurrentUserRefresh = 60; // 30secs
-        await API.refreshFriends();
-        API.closeWebSocket();
-        await API.getCurrentUser();
-        this.nextCurrentUserRefresh = 60; // 30secs
+        // If we just got user less then 1 min before code call, don't call it again
+        if ($app.nextCurrentUserRefresh < 720) {
+            await API.getCurrentUser().catch((err) => {
+                console.error(err);
+            });
+        }
+        await API.refreshFriends().catch((err) => {
+            console.error(err);
+        });
+        API.reconnectWebSocket();
     };
 
     $app.methods.refreshFriends = function (ref, origin) {
@@ -9043,6 +9251,40 @@ speechSynthesis.getVoices();
                 this.deleteFriend(id);
             }
         }
+
+        this.saveFriendOrder();
+    };
+
+    $app.methods.saveFriendOrder = async function () {
+        var currentTime = Date.now();
+        var lastStoreTime = await configRepository.getString(
+            `VRCX_lastStoreTime_${API.currentUser.id}`,
+            ''
+        );
+        // store once every week
+        if (lastStoreTime && currentTime - lastStoreTime < 604800000) {
+            return;
+        }
+        var storedData = {};
+        try {
+            var data = await configRepository.getString(
+                `VRCX_friendOrder_${API.currentUser.id}`
+            );
+            if (data) {
+                var storedData = JSON.parse(data);
+            }
+        } catch (err) {
+            console.error(err);
+        }
+        storedData[currentTime] = Array.from(this.friends.keys());
+        await configRepository.setString(
+            `VRCX_friendOrder_${API.currentUser.id}`,
+            JSON.stringify(storedData)
+        );
+        await configRepository.setString(
+            `VRCX_lastStoreTime_${API.currentUser.id}`,
+            currentTime
+        );
     };
 
     $app.methods.addFriend = function (id, state) {
@@ -9075,9 +9317,9 @@ speechSynthesis.getVoices();
             });
         }
         if (typeof ref === 'undefined') {
-            ref = this.friendLog.get(id);
-            if (typeof ref !== 'undefined' && ref.displayName) {
-                ctx.name = ref.displayName;
+            var friendLogRef = this.friendLog.get(id);
+            if (friendLogRef?.displayName) {
+                ctx.name = friendLogRef.displayName;
             }
         } else {
             ctx.name = ref.name;
@@ -9085,22 +9327,18 @@ speechSynthesis.getVoices();
         this.friends.set(id, ctx);
         if (ctx.state === 'online') {
             if (ctx.isVIP) {
-                this.sortFriendsGroup0 = true;
-                this.friendsGroup0_.push(ctx);
-                this.friendsGroupA_.unshift(ctx);
+                this.vipFriends_.push(ctx);
+                this.sortVIPFriends = true;
             } else {
-                this.sortFriendsGroup1 = true;
-                this.friendsGroup1_.push(ctx);
-                this.friendsGroupB_.unshift(ctx);
+                this.onlineFriends_.push(ctx);
+                this.sortOnlineFriends = true;
             }
         } else if (ctx.state === 'active') {
-            this.sortFriendsGroup2 = true;
-            this.friendsGroup2_.push(ctx);
-            this.friendsGroupC_.unshift(ctx);
+            this.activeFriends_.push(ctx);
+            this.sortActiveFriends = true;
         } else {
-            this.sortFriendsGroup3 = true;
-            this.friendsGroup3_.push(ctx);
-            this.friendsGroupD_.unshift(ctx);
+            this.offlineFriends_.push(ctx);
+            this.sortOfflineFriends = true;
         }
     };
 
@@ -9112,18 +9350,14 @@ speechSynthesis.getVoices();
         this.friends.delete(id);
         if (ctx.state === 'online') {
             if (ctx.isVIP) {
-                removeFromArray(this.friendsGroup0_, ctx);
-                removeFromArray(this.friendsGroupA_, ctx);
+                removeFromArray(this.vipFriends_, ctx);
             } else {
-                removeFromArray(this.friendsGroup1_, ctx);
-                removeFromArray(this.friendsGroupB_, ctx);
+                removeFromArray(this.onlineFriends_, ctx);
             }
         } else if (ctx.state === 'active') {
-            removeFromArray(this.friendsGroup2_, ctx);
-            removeFromArray(this.friendsGroupC_, ctx);
+            removeFromArray(this.activeFriends_, ctx);
         } else {
-            removeFromArray(this.friendsGroup3_, ctx);
-            removeFromArray(this.friendsGroupD_, ctx);
+            removeFromArray(this.offlineFriends_, ctx);
         }
     };
 
@@ -9201,37 +9435,23 @@ speechSynthesis.getVoices();
                         });
                     }
                     if (ctx.isVIP) {
-                        removeFromArray(this.friendsGroupA_, ctx);
-                        this.sortFriendsGroup0 = true;
-                        this.friendsGroupA_.unshift(ctx);
+                        this.sortVIPFriends = true;
                     } else {
-                        removeFromArray(this.friendsGroupB_, ctx);
-                        this.sortFriendsGroup0 = true;
-                        this.friendsGroupB_.unshift(ctx);
+                        this.sortOnlineFriends = true;
                     }
-                } else if (ctx.state === 'active') {
-                    removeFromArray(this.friendsGroupC_, ctx);
-                    this.friendsGroupC_.push(ctx);
-                } else {
-                    removeFromArray(this.friendsGroupD_, ctx);
-                    this.friendsGroupD_.push(ctx);
                 }
             }
             if (ctx.isVIP !== isVIP) {
                 ctx.isVIP = isVIP;
                 if (ctx.state === 'online') {
                     if (ctx.isVIP) {
-                        removeFromArray(this.friendsGroup1_, ctx);
-                        removeFromArray(this.friendsGroupB_, ctx);
-                        this.sortFriendsGroup0 = true;
-                        this.friendsGroup0_.push(ctx);
-                        this.friendsGroupA_.unshift(ctx);
+                        removeFromArray(this.onlineFriends_, ctx);
+                        this.vipFriends_.push(ctx);
+                        this.sortVIPFriends = true;
                     } else {
-                        removeFromArray(this.friendsGroup0_, ctx);
-                        removeFromArray(this.friendsGroupA_, ctx);
-                        this.sortFriendsGroup1 = true;
-                        this.friendsGroup1_.push(ctx);
-                        this.friendsGroupB_.unshift(ctx);
+                        removeFromArray(this.vipFriends_, ctx);
+                        this.onlineFriends_.push(ctx);
+                        this.sortOnlineFriends = true;
                     }
                 }
             }
@@ -9239,17 +9459,17 @@ speechSynthesis.getVoices();
                 ctx.name = ref.displayName;
                 if (ctx.state === 'online') {
                     if (ctx.isVIP) {
-                        this.sortFriendsGroup0 = true;
+                        this.sortVIPFriends = true;
                     } else {
-                        this.sortFriendsGroup1 = true;
+                        this.sortOnlineFriends = true;
                     }
                 } else if (ctx.state === 'active') {
-                    this.sortFriendsGroup2 = true;
+                    this.sortActiveFriends = true;
                 } else {
-                    this.sortFriendsGroup3 = true;
+                    this.sortOfflineFriends = true;
                 }
             }
-            // FIXME: 도배 가능성 있음
+            // from getCurrentUser only, fetch user if offline in an instance
             if (
                 origin &&
                 ctx.state !== 'online' &&
@@ -9293,7 +9513,6 @@ speechSynthesis.getVoices();
                     id,
                     ctx,
                     stateInput,
-                    isVIP,
                     location,
                     $location_at
                 );
@@ -9308,7 +9527,6 @@ speechSynthesis.getVoices();
                 id,
                 ctx,
                 stateInput,
-                isVIP,
                 location,
                 $location_at
             );
@@ -9319,7 +9537,6 @@ speechSynthesis.getVoices();
         id,
         ctx,
         stateInput,
-        isVIP,
         location,
         $location_at
     ) {
@@ -9332,20 +9549,11 @@ speechSynthesis.getVoices();
         ) {
             if (this.debugFriendState) {
                 console.log(
-                    ctx.name,
-                    new Date().toJSON(),
-                    'falsePositiveOffline',
-                    stateInput,
-                    ctx.ref.state
+                    `falsePositiveOffline ${ctx.name} currentState:${ctx.ref.state} expectedState:${stateInput}`
                 );
             }
             return;
         }
-        var newState = stateInput;
-        var args = await API.getUser({
-            userId: id
-        });
-        newState = args.ref.state;
         if (this.debugFriendState) {
             console.log(
                 ctx.name,
@@ -9355,7 +9563,9 @@ speechSynthesis.getVoices();
                 ctx.ref.state
             );
         }
-        var newRef = args.ref;
+        var isVIP = this.localFavoriteFriends.has(id);
+        var newState = stateInput;
+        var ref = ctx.ref;
         if (ctx.state !== newState && typeof ctx.ref !== 'undefined') {
             if (
                 (newState === 'offline' || newState === 'active') &&
@@ -9363,6 +9573,10 @@ speechSynthesis.getVoices();
             ) {
                 ctx.ref.$online_for = '';
                 ctx.ref.$offline_for = Date.now();
+                ctx.ref.$active_for = '';
+                if (newState === 'active') {
+                    ctx.ref.$active_for = Date.now();
+                }
                 var ts = Date.now();
                 var time = ts - $location_at;
                 var worldName = await this.getWorldName(location);
@@ -9370,8 +9584,8 @@ speechSynthesis.getVoices();
                 var feed = {
                     created_at: new Date().toJSON(),
                     type: 'Offline',
-                    userId: newRef.id,
-                    displayName: newRef.displayName,
+                    userId: ref.id,
+                    displayName: ref.displayName,
                     location,
                     worldName,
                     groupName,
@@ -9388,14 +9602,15 @@ speechSynthesis.getVoices();
                 ctx.ref.$location_at = Date.now();
                 ctx.ref.$online_for = Date.now();
                 ctx.ref.$offline_for = '';
-                var worldName = await this.getWorldName(newRef.location);
+                ctx.ref.$active_for = '';
+                var worldName = await this.getWorldName(ref.location);
                 var groupName = await this.getGroupName(location);
                 var feed = {
                     created_at: new Date().toJSON(),
                     type: 'Online',
                     userId: id,
                     displayName: ctx.name,
-                    location: newRef.location,
+                    location: ref.location,
                     worldName,
                     groupName,
                     time: ''
@@ -9403,46 +9618,41 @@ speechSynthesis.getVoices();
                 this.addFeed(feed);
                 database.addOnlineOfflineToDatabase(feed);
             }
+            if (newState === 'active') {
+                ctx.ref.$active_for = Date.now();
+            }
         }
         if (ctx.state === 'online') {
             if (ctx.isVIP) {
-                removeFromArray(this.friendsGroup0_, ctx);
-                removeFromArray(this.friendsGroupA_, ctx);
+                removeFromArray(this.vipFriends_, ctx);
             } else {
-                removeFromArray(this.friendsGroup1_, ctx);
-                removeFromArray(this.friendsGroupB_, ctx);
+                removeFromArray(this.onlineFriends_, ctx);
             }
         } else if (ctx.state === 'active') {
-            removeFromArray(this.friendsGroup2_, ctx);
-            removeFromArray(this.friendsGroupC_, ctx);
+            removeFromArray(this.activeFriends_, ctx);
         } else {
-            removeFromArray(this.friendsGroup3_, ctx);
-            removeFromArray(this.friendsGroupD_, ctx);
+            removeFromArray(this.offlineFriends_, ctx);
         }
         if (newState === 'online') {
             if (isVIP) {
-                this.sortFriendsGroup0 = true;
-                this.friendsGroup0_.push(ctx);
-                this.friendsGroupA_.unshift(ctx);
+                this.vipFriends_.push(ctx);
+                this.sortVIPFriends = true;
             } else {
-                this.sortFriendsGroup1 = true;
-                this.friendsGroup1_.push(ctx);
-                this.friendsGroupB_.unshift(ctx);
+                this.onlineFriends_.push(ctx);
+                this.sortOnlineFriends = true;
             }
         } else if (newState === 'active') {
-            this.sortFriendsGroup2 = true;
-            this.friendsGroup2_.push(ctx);
-            this.friendsGroupC_.unshift(ctx);
+            this.activeFriends_.push(ctx);
+            this.sortActiveFriends = true;
         } else {
-            this.sortFriendsGroup3 = true;
-            this.friendsGroup3_.push(ctx);
-            this.friendsGroupD_.unshift(ctx);
+            this.offlineFriends_.push(ctx);
+            this.sortOfflineFriends = true;
         }
         if (ctx.state !== newState) {
             this.updateOnlineFriendCoutner();
         }
         ctx.state = newState;
-        ctx.name = newRef.displayName;
+        ctx.name = ref.displayName;
         ctx.isVIP = isVIP;
     };
 
@@ -9485,31 +9695,18 @@ speechSynthesis.getVoices();
     };
 
     $app.methods.updateFriendGPS = function (userId) {
-        if (!this.orderFriendsGroupGPS) {
-            if (this.orderFriendsGroupPrivate || this.orderFriendsGroupStatus) {
-                this.sortFriendsGroup0 = true;
-                this.sortFriendsGroup1 = true;
-            }
-            return;
-        }
         var ctx = this.friends.get(userId);
-        if (typeof ctx.ref !== 'undefined' && ctx.state === 'online') {
-            if (ctx.isVIP) {
-                removeFromArray(this.friendsGroupA_, ctx);
-                this.sortFriendsGroup1 = true;
-                this.friendsGroupA_.unshift(ctx);
-            } else {
-                removeFromArray(this.friendsGroupB_, ctx);
-                this.sortFriendsGroup0 = true;
-                this.friendsGroupB_.unshift(ctx);
-            }
+        if (ctx.isVIP) {
+            this.sortVIPFriends = true;
+        } else {
+            this.sortOnlineFriends = true;
         }
     };
 
     $app.data.onlineFriendCount = 0;
     $app.methods.updateOnlineFriendCoutner = function () {
         var onlineFriendCount =
-            this.friendsGroup0.length + this.friendsGroup1.length;
+            this.vipFriends.length + this.onlineFriends.length;
         if (onlineFriendCount !== this.onlineFriendCount) {
             AppApi.ExecuteVrFeedFunction(
                 'updateOnlineFriendCount',
@@ -9521,34 +9718,33 @@ speechSynthesis.getVoices();
 
     // ascending
     var compareByName = function (a, b) {
-        var A = String(a.name).toUpperCase();
-        var B = String(b.name).toUpperCase();
-        if (A < B) {
-            return -1;
+        if (typeof a.name !== 'string' || typeof b.name !== 'string') {
+            return 0;
         }
-        if (A > B) {
-            return 1;
-        }
-        return 0;
+        return a.name.localeCompare(b.name);
     };
 
     // ascending
     var compareByDisplayName = function (a, b) {
-        var A = String(a.displayName).toUpperCase();
-        var B = String(b.displayName).toUpperCase();
-        if (A < B) {
-            return -1;
+        if (
+            typeof a.displayName !== 'string' ||
+            typeof b.displayName !== 'string'
+        ) {
+            return 0;
         }
-        if (A > B) {
-            return 1;
-        }
-        return 0;
+        return a.displayName.localeCompare(b.displayName);
     };
 
     // descending
     var compareByUpdatedAt = function (a, b) {
-        var A = String(a.updated_at).toUpperCase();
-        var B = String(b.updated_at).toUpperCase();
+        if (
+            typeof a.updated_at !== 'string' ||
+            typeof b.updated_at !== 'string'
+        ) {
+            return 0;
+        }
+        var A = a.updated_at.toUpperCase();
+        var B = b.updated_at.toUpperCase();
         if (A < B) {
             return 1;
         }
@@ -9560,8 +9756,14 @@ speechSynthesis.getVoices();
 
     // descending
     var compareByCreatedAt = function (a, b) {
-        var A = String(a.created_at).toUpperCase();
-        var B = String(b.created_at).toUpperCase();
+        if (
+            typeof a.created_at !== 'string' ||
+            typeof b.created_at !== 'string'
+        ) {
+            return 0;
+        }
+        var A = a.created_at.toUpperCase();
+        var B = b.created_at.toUpperCase();
         if (A < B) {
             return 1;
         }
@@ -9586,15 +9788,8 @@ speechSynthesis.getVoices();
         return 0;
     };
 
-    // status
     var compareByStatus = function (a, b) {
         if (typeof a.ref === 'undefined' || typeof b.ref === 'undefined') {
-            return 0;
-        }
-        if (
-            $app.orderFriendsGroupPrivate &&
-            (a.ref.location !== 'private' || b.ref.location !== 'private')
-        ) {
             return 0;
         }
         if (a.ref.status === b.ref.status) {
@@ -9604,10 +9799,6 @@ speechSynthesis.getVoices();
             return 1;
         }
         return $app.sortStatus(a.ref.status, b.ref.status);
-    };
-
-    $app.methods.sortByStatus = function (a, b, field) {
-        return this.sortStatus(a[field], b[field]);
     };
 
     $app.methods.sortStatus = function (a, b) {
@@ -9676,76 +9867,159 @@ speechSynthesis.getVoices();
         return 0;
     };
 
+    // location at but for the sidebar
+    var compareByLocation = function (a, b) {
+        if (typeof a.ref === 'undefined' || typeof b.ref === 'undefined') {
+            return 0;
+        }
+        if (a.state !== 'online' || b.state !== 'online') {
+            return 0;
+        }
+
+        return a.ref.location.localeCompare(b.ref.location);
+    };
+
+    var compareByActivityField = function (a, b, field) {
+        if (typeof a.ref === 'undefined' || typeof b.ref === 'undefined') {
+            return 0;
+        }
+
+        // When the field is just and empty string, it means they've been
+        // in whatever active state for the longest
+        if (
+            a.ref[field] < b.ref[field] ||
+            (a.ref[field] !== '' && b.ref[field] === '')
+        ) {
+            return 1;
+        }
+        if (
+            a.ref[field] > b.ref[field] ||
+            (a.ref[field] === '' && b.ref[field] !== '')
+        ) {
+            return -1;
+        }
+        return 0;
+    };
+
+    // last active
+    var compareByLastActive = function (a, b) {
+        if (a.state === 'online' && b.state === 'online') {
+            if (
+                a.ref?.$online_for &&
+                b.ref?.$online_for &&
+                a.ref.$online_for === b.ref.$online_for
+            ) {
+                compareByActivityField(a, b, 'last_login');
+            }
+            return compareByActivityField(a, b, '$online_for');
+        }
+
+        return compareByActivityField(a, b, 'last_activity');
+    };
+
+    var getFriendsSortFunction = function (sortMethods) {
+        const sorts = [];
+        for (const sortMethod of sortMethods) {
+            switch (sortMethod) {
+                case 'Sort Alphabetically':
+                    sorts.push(compareByName);
+                    break;
+                case 'Sort Private to Bottom':
+                    sorts.push(compareByPrivate);
+                    break;
+                case 'Sort by Status':
+                    sorts.push(compareByStatus);
+                    break;
+                case 'Sort by Last Active':
+                    sorts.push(compareByLastActive);
+                    break;
+                case 'Sort by Time in Instance':
+                    sorts.push((a, b) => {
+                        if (
+                            typeof a.ref === 'undefined' ||
+                            typeof b.ref === 'undefined'
+                        ) {
+                            return 0;
+                        }
+                        if (a.state !== 'online' || b.state !== 'online') {
+                            return 0;
+                        }
+
+                        return compareByLocationAt(b.ref, a.ref);
+                    });
+                    break;
+                case 'Sort by Location':
+                    sorts.push(compareByLocation);
+                    break;
+                case 'None':
+                    sorts.push(() => 0);
+                    break;
+            }
+        }
+
+        return (a, b) => {
+            let res;
+            for (const sort of sorts) {
+                res = sort(a, b);
+                if (res !== 0) {
+                    return res;
+                }
+            }
+            return res;
+        };
+    };
+
     // VIP friends
-    $app.computed.friendsGroup0 = function () {
-        if (this.orderFriendsGroup0) {
-            if (this.orderFriendsGroupPrivate) {
-                this.friendsGroupA_.sort(compareByPrivate);
-            }
-            if (this.orderFriendsGroupStatus) {
-                this.friendsGroupA_.sort(compareByStatus);
-            }
-            return this.friendsGroupA_;
+    $app.computed.vipFriends = function () {
+        if (!this.sortVIPFriends) {
+            return this.vipFriends_;
         }
-        if (this.sortFriendsGroup0) {
-            this.sortFriendsGroup0 = false;
-            this.friendsGroup0_.sort(compareByName);
-            if (this.orderFriendsGroupPrivate) {
-                this.friendsGroup0_.sort(compareByPrivate);
-            }
-            if (this.orderFriendsGroupStatus) {
-                this.friendsGroup0_.sort(compareByStatus);
-            }
-        }
-        return this.friendsGroup0_;
+        this.sortVIPFriends = false;
+
+        this.vipFriends_.sort(getFriendsSortFunction(this.sidebarSortMethods));
+        return this.vipFriends_;
     };
 
     // Online friends
-    $app.computed.friendsGroup1 = function () {
-        if (this.orderFriendsGroup1) {
-            if (this.orderFriendsGroupPrivate) {
-                this.friendsGroupB_.sort(compareByPrivate);
-            }
-            if (this.orderFriendsGroupStatus) {
-                this.friendsGroupB_.sort(compareByStatus);
-            }
-            return this.friendsGroupB_;
+    $app.computed.onlineFriends = function () {
+        if (!this.sortOnlineFriends) {
+            return this.onlineFriends_;
         }
-        if (this.sortFriendsGroup1) {
-            this.sortFriendsGroup1 = false;
-            this.friendsGroup1_.sort(compareByName);
-            if (this.orderFriendsGroupPrivate) {
-                this.friendsGroup1_.sort(compareByPrivate);
-            }
-            if (this.orderFriendsGroupStatus) {
-                this.friendsGroup1_.sort(compareByStatus);
-            }
-        }
-        return this.friendsGroup1_;
+        this.sortOnlineFriends = false;
+
+        this.onlineFriends_.sort(
+            getFriendsSortFunction(this.sidebarSortMethods)
+        );
+
+        return this.onlineFriends_;
     };
 
     // Active friends
-    $app.computed.friendsGroup2 = function () {
-        if (this.orderFriendsGroup2) {
-            return this.friendsGroupC_;
+    $app.computed.activeFriends = function () {
+        if (!this.sortActiveFriends) {
+            return this.activeFriends_;
         }
-        if (this.sortFriendsGroup2) {
-            this.sortFriendsGroup2 = false;
-            this.friendsGroup2_.sort(compareByName);
-        }
-        return this.friendsGroup2_;
+        this.sortActiveFriends = false;
+
+        this.activeFriends_.sort(
+            getFriendsSortFunction(this.sidebarSortMethods)
+        );
+
+        return this.activeFriends_;
     };
 
     // Offline friends
-    $app.computed.friendsGroup3 = function () {
-        if (this.orderFriendsGroup3) {
-            return this.friendsGroupD_;
+    $app.computed.offlineFriends = function () {
+        if (!this.sortOfflineFriends) {
+            return this.offlineFriends_;
         }
-        if (this.sortFriendsGroup3) {
-            this.sortFriendsGroup3 = false;
-            this.friendsGroup3_.sort(compareByName);
-        }
-        return this.friendsGroup3_;
+        this.sortOfflineFriends = false;
+
+        this.offlineFriends_.sort(
+            getFriendsSortFunction(this.sidebarSortMethods)
+        );
+
+        return this.offlineFriends_;
     };
 
     $app.methods.userStatusClass = function (user, pendingOffline) {
@@ -9849,65 +10123,129 @@ speechSynthesis.getVoices();
     $app.data.quickSearch = '';
     $app.data.quickSearchItems = [];
 
-    $app.methods.quickSearchRemoteMethod = function (query) {
-        var results = [];
-        if (query) {
-            var QUERY = query.toUpperCase();
-            for (var ctx of this.friends.values()) {
-                if (typeof ctx.ref === 'undefined') {
-                    continue;
-                }
-                var NAME = ctx.name.toUpperCase();
-                var match = NAME.includes(QUERY);
-                if (!match && ctx.memo) {
-                    match = String(ctx.memo).toUpperCase().includes(QUERY);
-                }
-                if (!match && ctx.ref.note) {
-                    match = String(ctx.ref.note).toUpperCase().includes(QUERY);
-                }
-                if (match) {
-                    results.push({
-                        value: ctx.id,
-                        label: ctx.name,
-                        ref: ctx.ref,
-                        NAME
-                    });
-                }
-            }
-            results.sort(function (a, b) {
-                var A = a.NAME.startsWith(QUERY);
-                var B = b.NAME.startsWith(QUERY);
-                if (A !== B) {
-                    if (A) {
-                        return -1;
-                    }
-                    if (B) {
-                        return 1;
-                    }
-                }
-                if (a.NAME < b.NAME) {
-                    return -1;
-                }
-                if (a.NAME > b.NAME) {
-                    return 1;
-                }
-                return 0;
-            });
-            if (results.length > 4) {
-                results.length = 4;
-            }
-            results.push({
-                value: `search:${query}`,
-                label: query
-            });
+    var localeIncludes = function (str, search, comparer) {
+        // These checks are stolen from https://stackoverflow.com/a/69623589/11030436
+        if (search === '') {
+            return true;
+        } else if (!str || !search) {
+            return false;
         }
+        const strObj = String(str);
+        const searchObj = String(search);
+
+        if (strObj.length === 0) {
+            return false;
+        }
+
+        if (searchObj.length > strObj.length) {
+            return false;
+        }
+
+        // Now simply loop through each substring and compare them
+        for (let i = 0; i < str.length - searchObj.length + 1; i++) {
+            const substr = strObj.substring(i, i + searchObj.length);
+            if (comparer.compare(substr, searchObj) === 0) {
+                return true;
+            }
+        }
+        return false;
+    };
+
+    // Making a persistent comparer increases perf by like 10x lmao
+    $app.data._stringComparer = undefined;
+    $app.computed.stringComparer = function () {
+        if (typeof this._stringComparer === 'undefined') {
+            this._stringComparer = Intl.Collator(
+                this.appLanguage.replace('_', '-'),
+                { usage: 'search', sensitivity: 'base' }
+            );
+        }
+        return this._stringComparer;
+    };
+
+    $app.methods.quickSearchRemoteMethod = function (query) {
+        if (!query) {
+            this.quickSearchItems = [];
+        }
+
+        const results = [];
+        const cleanQuery = removeWhitespace(query);
+
+        for (let ctx of this.friends.values()) {
+            if (typeof ctx.ref === 'undefined') {
+                continue;
+            }
+
+            const cleanName = removeConfusables(ctx.name);
+            let match = localeIncludes(
+                cleanName,
+                cleanQuery,
+                this.stringComparer
+            );
+            if (!match) {
+                // Also check regular name in case search is with special characters
+                match = localeIncludes(
+                    ctx.name,
+                    cleanQuery,
+                    this.stringComparer
+                );
+            }
+            // Use query with whitespace for notes and memos as people are more
+            // likely to include spaces in memos and notes
+            if (!match && ctx.memo) {
+                match = localeIncludes(ctx.memo, query, this.stringComparer);
+            }
+            if (!match && ctx.ref.note) {
+                match = localeIncludes(
+                    ctx.ref.note,
+                    query,
+                    this.stringComparer
+                );
+            }
+
+            if (match) {
+                results.push({
+                    value: ctx.id,
+                    label: ctx.name,
+                    ref: ctx.ref,
+                    name: ctx.name
+                });
+            }
+        }
+
+        results.sort(function (a, b) {
+            var A =
+                $app.stringComparer.compare(
+                    a.name.substring(0, cleanQuery.length),
+                    cleanQuery
+                ) === 0;
+            var B =
+                $app.stringComparer.compare(
+                    b.name.substring(0, cleanQuery.length),
+                    cleanQuery
+                ) === 0;
+            if (A && !B) {
+                return -1;
+            } else if (B && !A) {
+                return 1;
+            }
+            return compareByName(a, b);
+        });
+        if (results.length > 4) {
+            results.length = 4;
+        }
+        results.push({
+            value: `search:${query}`,
+            label: query
+        });
+
         this.quickSearchItems = results;
     };
 
     $app.methods.quickSearchChange = function (value) {
         if (value) {
             if (value.startsWith('search:')) {
-                var searchText = value.substr(7);
+                const searchText = value.substr(7);
                 if (this.quickSearchItems.length > 1 && searchText.length) {
                     this.friendsListSearch = searchText;
                     this.$refs.menu.activeIndex = 'friendsList';
@@ -10081,6 +10419,8 @@ speechSynthesis.getVoices();
         this.feedTable.loading = false;
     };
 
+    $app.data.dontLogMeOut = false;
+
     API.$on('LOGIN', async function (args) {
         $app.friendLog = new Map();
         $app.feedTable.data = [];
@@ -10113,12 +10453,14 @@ speechSynthesis.getVoices();
                 await $app.initFriendLog(args.json.id);
             }
         } catch (err) {
-            $app.$message({
-                message: 'Failed to load freinds list, logging out',
-                type: 'error'
-            });
-            this.logout();
-            throw err;
+            if (!$app.dontLogMeOut) {
+                $app.$message({
+                    message: 'Failed to load freinds list, logging out',
+                    type: 'error'
+                });
+                this.logout();
+                throw err;
+            }
         }
         $app.getAvatarHistory();
         $app.getAllMemos();
@@ -10271,9 +10613,6 @@ speechSynthesis.getVoices();
                 ref.$previousLocation = '';
                 ref.$travelingToTime = Date.now();
             }
-            if (friend.state !== 'online') {
-                API.getUser({ userId: ref.id });
-            }
         }
         if (
             props.location &&
@@ -10285,11 +10624,22 @@ speechSynthesis.getVoices();
             ref.$travelingToTime = Date.now();
             $app.updateFriendGPS(ref.id);
         }
+        var imageMatches = false;
         if (
-            ((props.currentAvatarImageUrl ||
+            props.currentAvatarThumbnailImageUrl &&
+            props.currentAvatarThumbnailImageUrl[0] &&
+            props.currentAvatarThumbnailImageUrl[1] &&
+            props.currentAvatarThumbnailImageUrl[0] ===
+                props.currentAvatarThumbnailImageUrl[1]
+        ) {
+            imageMatches = true;
+        }
+        if (
+            (((props.currentAvatarImageUrl ||
                 props.currentAvatarThumbnailImageUrl) &&
                 !ref.profilePicOverride) ||
-            props.currentAvatarTags
+                props.currentAvatarTags) &&
+            !imageMatches
         ) {
             var currentAvatarImageUrl = '';
             var previousCurrentAvatarImageUrl = '';
@@ -10829,22 +11179,26 @@ speechSynthesis.getVoices();
         this.addGameLogEntry(gameLog, this.lastLocation.location);
     };
 
-    $app.methods.deleteGameLogEntry = function (row) {
+    $app.methods.deleteGameLogEntryPrompt = function (row) {
         this.$confirm('Continue? Delete Log', 'Confirm', {
             confirmButtonText: 'Confirm',
             cancelButtonText: 'Cancel',
             type: 'info',
             callback: (action) => {
                 if (action === 'confirm') {
-                    removeFromArray(this.gameLogTable.data, row);
-                    database.deleteGameLogEntry(row);
-                    console.log(row);
-                    database.getGamelogDatabase().then((data) => {
-                        this.gameLogSessionTable = data;
-                        this.updateSharedFeed(true);
-                    });
+                    this.deleteGameLogEntry(row);
                 }
             }
+        });
+    };
+
+    $app.methods.deleteGameLogEntry = function (row) {
+        removeFromArray(this.gameLogTable.data, row);
+        database.deleteGameLogEntry(row);
+        console.log(row);
+        database.getGamelogDatabase().then((data) => {
+            this.gameLogSessionTable = data;
+            this.updateSharedFeed(true);
         });
     };
 
@@ -10858,8 +11212,8 @@ speechSynthesis.getVoices();
         if (this.gameLogDisabled) {
             return;
         }
-        var userId = '';
-        if (gameLog.displayName) {
+        var userId = gameLog.userId;
+        if (!userId && gameLog.displayName) {
             for (var ref of API.cachedUsers.values()) {
                 if (ref.displayName === gameLog.displayName) {
                     userId = ref.id;
@@ -10890,6 +11244,10 @@ speechSynthesis.getVoices();
                 }
                 break;
             case 'location':
+                this.addInstanceJoinHistory(
+                    this.lastLocation.location,
+                    gameLog.dt
+                );
                 var worldName = this.replaceBioSymbols(gameLog.worldName);
                 if (this.isGameRunning) {
                     this.lastLocationReset(gameLog.dt);
@@ -10909,6 +11267,7 @@ speechSynthesis.getVoices();
                     this.applyWorldDialogInstances();
                     this.applyGroupDialogInstances();
                 }
+                this.addInstanceJoinHistory(gameLog.location, gameLog.dt);
                 var L = API.parseLocation(gameLog.location);
                 var entry = {
                     created_at: gameLog.dt,
@@ -10953,6 +11312,11 @@ speechSynthesis.getVoices();
                     } else if (typeof ref !== 'undefined') {
                         // set $location_at to join time if user isn't a friend
                         ref.$location_at = joinTime;
+                    } else {
+                        if (this.debugGameLog || this.debugWebRequests) {
+                            console.log('Fetching user from gameLog:', userId);
+                        }
+                        API.getUser({ userId });
                     }
                 } else {
                     // try fetch userId from previous encounter using database
@@ -11102,12 +11466,20 @@ speechSynthesis.getVoices();
                 } catch (err) {
                     console.error(err);
                 }
-                if (userId) {
-                    this.gameLogApiLoggingEnabled = true;
-                    if (!API.cachedUsers.has(userId)) {
-                        API.getUser({ userId });
-                    }
+                if (!userId) {
+                    break;
                 }
+                this.gameLogApiLoggingEnabled = true;
+                if (
+                    API.cachedUsers.has(userId) ||
+                    API.cachedPlayerModerationsUserIds.has(userId)
+                ) {
+                    break;
+                }
+                if (this.debugGameLog || this.debugWebRequests) {
+                    console.log('Fetching user from gameLog:', userId);
+                }
+                API.getUser({ userId });
                 break;
             case 'avatar-change':
                 var ref = this.lastLocation.playerList.get(gameLog.displayName);
@@ -11186,27 +11558,29 @@ speechSynthesis.getVoices();
                 database.addGamelogEventToDatabase(entry);
                 break;
             case 'vrc-quit':
-                if (!this.vrcQuitFix || !this.isGameRunning) {
+                if (!this.isGameRunning) {
                     break;
                 }
-                var bias = Date.parse(gameLog.dt) + 3000;
-                if (bias < Date.now()) {
-                    console.log('QuitFix: Bias too low, not killing VRC');
-                    break;
-                }
-                AppApi.QuitGame().then((processCount) => {
-                    if (processCount > 1) {
-                        console.log(
-                            'QuitFix: More than 1 process running, not killing VRC'
-                        );
-                    } else if (processCount === 1) {
-                        console.log('QuitFix: Killed VRC');
-                    } else {
-                        console.log(
-                            'QuitFix: Nothing to kill, no VRC process running'
-                        );
+                if (this.vrcQuitFix) {
+                    var bias = Date.parse(gameLog.dt) + 3000;
+                    if (bias < Date.now()) {
+                        console.log('QuitFix: Bias too low, not killing VRC');
+                        break;
                     }
-                });
+                    AppApi.QuitGame().then((processCount) => {
+                        if (processCount > 1) {
+                            console.log(
+                                'QuitFix: More than 1 process running, not killing VRC'
+                            );
+                        } else if (processCount === 1) {
+                            console.log('QuitFix: Killed VRC');
+                        } else {
+                            console.log(
+                                'QuitFix: Nothing to kill, no VRC process running'
+                            );
+                        }
+                    });
+                }
                 break;
             case 'openvr-init':
                 this.isGameNoVR = false;
@@ -11273,7 +11647,7 @@ speechSynthesis.getVoices();
             return;
         }
         if (this.debugGameLog) {
-            console.log('Fetching userId for', displayName);
+            console.log('Searching for userId for:', displayName);
         }
         var params = {
             n: 5,
@@ -11864,7 +12238,8 @@ speechSynthesis.getVoices();
                             groupOnNameplate: user.groupOnNameplate,
                             showGroupBadgeToOthers: user.showGroupBadgeToOthers,
                             showSocialRank: user.showSocialRank,
-                            useImpostorAsFallback: user.useImpostorAsFallback
+                            useImpostorAsFallback: user.useImpostorAsFallback,
+                            platform: user.platform
                         });
                         this.photonUserJoin(id, user, gameLogDate);
                     }
@@ -11901,7 +12276,8 @@ speechSynthesis.getVoices();
                         groupOnNameplate: user.groupOnNameplate,
                         showGroupBadgeToOthers: user.showGroupBadgeToOthers,
                         showSocialRank: user.showSocialRank,
-                        useImpostorAsFallback: user.useImpostorAsFallback
+                        useImpostorAsFallback: user.useImpostorAsFallback,
+                        platform: user.platform
                     });
                     this.photonUserJoin(id, user, gameLogDate);
                 }
@@ -11935,7 +12311,8 @@ speechSynthesis.getVoices();
                     groupOnNameplate: user.groupOnNameplate,
                     showGroupBadgeToOthers: user.showGroupBadgeToOthers,
                     showSocialRank: user.showSocialRank,
-                    useImpostorAsFallback: user.useImpostorAsFallback
+                    useImpostorAsFallback: user.useImpostorAsFallback,
+                    platform: user.platform
                 });
                 break;
             case 255:
@@ -11985,7 +12362,8 @@ speechSynthesis.getVoices();
                         data.Parameters[249].showGroupBadgeToOthers,
                     showSocialRank: data.Parameters[249].showSocialRank,
                     useImpostorAsFallback:
-                        data.Parameters[249].useImpostorAsFallback
+                        data.Parameters[249].useImpostorAsFallback,
+                    platform: data.Parameters[249].platform
                 });
                 this.photonUserJoin(
                     data.Parameters[254],
@@ -12874,7 +13252,8 @@ speechSynthesis.getVoices();
             for (var unityPackage of unityPackages) {
                 if (
                     unityPackage.variant &&
-                    unityPackage.variant !== 'standard'
+                    unityPackage.variant !== 'standard' &&
+                    unityPackage.variant !== 'security'
                 ) {
                     continue;
                 }
@@ -13530,10 +13909,11 @@ speechSynthesis.getVoices();
             this.lastLocation$ = L;
         }
         var hidePrivate = false;
-        // (L.accessType === 'group' && !L.groupAccessType) || L.groupAccessType === 'member')
         if (
             this.discordHideInvite &&
-            (L.accessType === 'invite' || L.accessType === 'invite+')
+            (L.accessType === 'invite' ||
+                L.accessType === 'invite+' ||
+                L.groupAccessType === 'members')
         ) {
             hidePrivate = true;
         }
@@ -14449,6 +14829,12 @@ speechSynthesis.getVoices();
             {
                 prop: 'displayName',
                 value: ''
+            },
+            {
+                prop: 'type',
+                value: false,
+                filterFn: (row, filter) =>
+                    !(filter.value && row.type === 'Unfriend')
             }
         ],
         tableProps: {
@@ -14513,7 +14899,7 @@ speechSynthesis.getVoices();
         }
         var friendLogHistory = {
             created_at: new Date().toJSON(),
-            type: 'CancelFriendRequst',
+            type: 'CancelFriendRequest',
             userId: ref.id,
             displayName: ref.displayName
         };
@@ -14656,7 +15042,9 @@ speechSynthesis.getVoices();
                 this.queueFriendLogNoty(friendLogHistory);
                 this.friendLog.delete(id);
                 database.deleteFriendLogCurrent(id);
-                this.notifyMenu('friendLog');
+                if (!this.hideUnfriends) {
+                    this.notifyMenu('friendLog');
+                }
                 this.updateSharedFeed(true);
                 this.deleteFriend(id);
             }
@@ -14811,17 +15199,11 @@ speechSynthesis.getVoices();
         var { length } = array;
         for (var i = 0; i < length; ++i) {
             if (array[i].id === ref.id) {
-                if (ref.$isDeleted) {
-                    array.splice(i, 1);
-                } else {
-                    Vue.set(array, i, ref);
-                }
+                Vue.set(array, i, ref);
                 return;
             }
         }
-        if (ref.$isDeleted === false) {
-            $app.playerModerationTable.data.push(ref);
-        }
+        $app.playerModerationTable.data.push(ref);
     });
 
     API.$on('PLAYER-MODERATION:@DELETE', function (args) {
@@ -14902,7 +15284,6 @@ speechSynthesis.getVoices();
             currentLocation = $app.lastLocationDestination;
         }
         if (!currentLocation) return;
-        var L = this.parseLocation(currentLocation);
         if (
             $app.autoAcceptInviteRequests === 'All Favorites' &&
             !$app.favoriteFriends.some((x) => x.id === ref.senderUserId)
@@ -14915,6 +15296,9 @@ speechSynthesis.getVoices();
         )
             return;
 
+        if (!$app.checkCanInvite(currentLocation)) return;
+
+        var L = this.parseLocation(currentLocation);
         this.getCachedWorld({
             worldId: L.worldId
         }).then((args1) => {
@@ -14926,10 +15310,14 @@ speechSynthesis.getVoices();
                     rsvp: true
                 },
                 ref.senderUserId
-            ).then((_args) => {
-                $app.$message(`Auto invite sent to ${ref.senderUsername}`);
-                return _args;
-            });
+            )
+                .then((_args) => {
+                    $app.$message(`Auto invite sent to ${ref.senderUsername}`);
+                    return _args;
+                })
+                .catch((err) => {
+                    console.error(err);
+                });
         });
     });
 
@@ -15141,6 +15529,7 @@ speechSynthesis.getVoices();
         },
         layout: 'table'
     };
+    $app.data.stickerTable = [];
     $app.data.emojiTable = [];
     $app.data.VRCPlusIconsTable = [];
     $app.data.galleryTable = [];
@@ -15399,10 +15788,7 @@ speechSynthesis.getVoices();
             '[ "https://avtr.just-h.party/vrcx_search.php" ]'
         )
     );
-    $app.data.pendingOfflineDelay = await configRepository.getInt(
-        'VRCX_pendingOfflineDelay',
-        110000
-    );
+    $app.data.pendingOfflineDelay = 110000;
     if (await configRepository.getString('VRCX_avatarRemoteDatabaseProvider')) {
         // move existing provider to new list
         var avatarRemoteDatabaseProvider = await configRepository.getString(
@@ -15443,6 +15829,11 @@ speechSynthesis.getVoices();
         'VRCX_hideUserMemos',
         false
     );
+    $app.data.hideUnfriends = await configRepository.getBool(
+        'VRCX_hideUnfriends',
+        false
+    );
+    $app.data.friendLogTable.filters[2].value = $app.data.hideUnfriends;
     $app.methods.saveOpenVROption = async function () {
         await configRepository.setBool('openVR', this.openVR);
         await configRepository.setBool('openVRAlways', this.openVRAlways);
@@ -15566,6 +15957,13 @@ speechSynthesis.getVoices();
             this.hideUserMemos
         );
     };
+    $app.methods.saveFriendLogOptions = async function () {
+        await configRepository.setBool(
+            'VRCX_hideUnfriends',
+            this.hideUnfriends
+        );
+        this.friendLogTable.filters[2].value = this.hideUnfriends;
+    };
     $app.data.TTSvoices = speechSynthesis.getVoices();
     $app.methods.saveNotificationTTS = async function () {
         speechSynthesis.cancel();
@@ -15597,16 +15995,22 @@ speechSynthesis.getVoices();
         .matchMedia('(prefers-color-scheme: dark)')
         .addEventListener('change', async () => {
             if ($app.themeMode === 'system') {
-                await $app.saveThemeMode();
+                await $app.changeThemeMode();
             }
         });
 
-    $app.methods.saveThemeMode = async function () {
+    $app.methods.saveThemeMode = async function (newThemeMode) {
+        this.themeMode = newThemeMode;
         await configRepository.setString('VRCX_ThemeMode', this.themeMode);
         await this.changeThemeMode();
     };
 
     $app.methods.changeThemeMode = async function () {
+        if (
+            document.contains(document.getElementById('app-theme-dark-style'))
+        ) {
+            document.getElementById('app-theme-dark-style').remove();
+        }
         if (document.contains(document.getElementById('app-theme-style'))) {
             document.getElementById('app-theme-style').remove();
         }
@@ -15619,7 +16023,11 @@ speechSynthesis.getVoices();
                 this.isDarkMode = false;
                 break;
             case 'dark':
-                $appThemeStyle.href = 'theme.dark.css';
+                $appThemeStyle.href = '';
+                this.isDarkMode = true;
+                break;
+            case 'darkvanillaold':
+                $appThemeStyle.href = 'theme.darkvanillaold.css';
                 this.isDarkMode = true;
                 break;
             case 'darkvanilla':
@@ -15635,21 +16043,22 @@ speechSynthesis.getVoices();
                 this.isDarkMode = true;
                 break;
             case 'system':
-                if (this.systemIsDarkMode()) {
-                    $appThemeStyle.href = 'theme.dark.css';
-                    this.isDarkMode = true;
-                } else {
-                    $appThemeStyle.href = '';
-                    this.isDarkMode = false;
-                }
+                this.isDarkMode = this.systemIsDarkMode();
                 break;
         }
         if (this.isDarkMode) {
             AppApi.ChangeTheme(1);
+            var $appThemeDarkStyle = document.createElement('link');
+            $appThemeDarkStyle.setAttribute('id', 'app-theme-dark-style');
+            $appThemeDarkStyle.rel = 'stylesheet';
+            $appThemeDarkStyle.href = 'theme.dark.css';
+            document.head.appendChild($appThemeDarkStyle);
         } else {
             AppApi.ChangeTheme(0);
         }
-        document.head.appendChild($appThemeStyle);
+        if ($appThemeStyle.href) {
+            document.head.appendChild($appThemeStyle);
+        }
         this.updateVRConfigVars();
         await this.updatetrustColor();
     };
@@ -15672,6 +16081,10 @@ speechSynthesis.getVoices();
     if (!(await VRCXStorage.Get('VRCX_DatabaseLocation'))) {
         await VRCXStorage.Set('VRCX_DatabaseLocation', '');
     }
+    if (!(await VRCXStorage.Get('VRCX_ProxyServer'))) {
+        await VRCXStorage.Set('VRCX_ProxyServer', '');
+    }
+    $app.data.proxyServer = await VRCXStorage.Get('VRCX_ProxyServer');
     $app.data.disableWorldDatabase =
         (await VRCXStorage.Get('VRCX_DisableWorldDatabase')) === 'true';
     $app.methods.saveVRCXWindowOption = async function () {
@@ -15794,65 +16207,108 @@ speechSynthesis.getVoices();
             this.vrcRegistryAutoBackup
         );
     };
-    $app.data.orderFriendsGroup0 = await configRepository.getBool(
-        'orderFriendGroup0',
-        true
+    $app.data.sidebarSortMethod1 = '';
+    $app.data.sidebarSortMethod2 = '';
+    $app.data.sidebarSortMethod3 = '';
+    $app.data.sidebarSortMethods = JSON.parse(
+        await configRepository.getString(
+            'VRCX_sidebarSortMethods',
+            JSON.stringify([
+                'Sort Private to Bottom',
+                'Sort by Time in Instance',
+                'Sort by Last Active'
+            ])
+        )
     );
-    $app.data.orderFriendsGroup1 = await configRepository.getBool(
-        'orderFriendGroup1',
-        true
+    if ($app.data.sidebarSortMethods?.length === 3) {
+        $app.data.sidebarSortMethod1 = $app.data.sidebarSortMethods[0];
+        $app.data.sidebarSortMethod2 = $app.data.sidebarSortMethods[1];
+        $app.data.sidebarSortMethod3 = $app.data.sidebarSortMethods[2];
+    }
+
+    // Migrate old settings
+    // Assume all exist if one does
+    const orderFriendsGroupPrivate = await configRepository.getBool(
+        'orderFriendGroupPrivate'
     );
-    $app.data.orderFriendsGroup2 = await configRepository.getBool(
-        'orderFriendGroup2',
-        true
-    );
-    $app.data.orderFriendsGroup3 = await configRepository.getBool(
-        'orderFriendGroup3',
-        true
-    );
-    $app.data.orderFriendsGroupPrivate = await configRepository.getBool(
-        'orderFriendGroupPrivate',
-        false
-    );
-    $app.data.orderFriendsGroupStatus = await configRepository.getBool(
-        'orderFriendsGroupStatus',
-        false
-    );
-    $app.data.orderFriendsGroupGPS = await configRepository.getBool(
-        'orderFriendGroupGPS',
-        true
-    );
-    $app.methods.saveOrderFriendGroup = async function () {
-        await configRepository.setBool(
-            'orderFriendGroup0',
-            this.orderFriendsGroup0
+    if (orderFriendsGroupPrivate !== null) {
+        await configRepository.remove('orderFriendGroupPrivate');
+
+        const orderFriendsGroupStatus = await configRepository.getBool(
+            'orderFriendsGroupStatus'
         );
-        await configRepository.setBool(
-            'orderFriendGroup1',
-            this.orderFriendsGroup1
+        await configRepository.remove('orderFriendsGroupStatus');
+
+        const orderFriendsGroupGPS = await configRepository.getBool(
+            'orderFriendGroupGPS'
         );
-        await configRepository.setBool(
-            'orderFriendGroup2',
-            this.orderFriendsGroup2
+        await configRepository.remove('orderFriendGroupGPS');
+
+        const orderOnlineFor =
+            await configRepository.getBool('orderFriendGroup0');
+        await configRepository.remove('orderFriendGroup0');
+        await configRepository.remove('orderFriendGroup1');
+        await configRepository.remove('orderFriendGroup2');
+        await configRepository.remove('orderFriendGroup3');
+
+        var sortOrder = [];
+        if (orderFriendsGroupPrivate) {
+            sortOrder.push('Sort Private to Bottom');
+        }
+        if (orderFriendsGroupStatus) {
+            sortOrder.push('Sort by Status');
+        }
+        if (orderOnlineFor && orderFriendsGroupGPS) {
+            sortOrder.push('Sort by Time in Instance');
+        }
+        if (!orderOnlineFor) {
+            sortOrder.push('Sort Alphabetically');
+        }
+
+        if (sortOrder.length > 0) {
+            while (sortOrder.length < 3) {
+                sortOrder.push('');
+            }
+            $app.data.sidebarSortMethods = sortOrder;
+            $app.data.sidebarSortMethod1 = sortOrder[0];
+            $app.data.sidebarSortMethod2 = sortOrder[1];
+            $app.data.sidebarSortMethod3 = sortOrder[2];
+        }
+        await configRepository.setString(
+            'VRCX_sidebarSortMethods',
+            JSON.stringify(sortOrder)
         );
-        await configRepository.setBool(
-            'orderFriendGroup3',
-            this.orderFriendsGroup3
+    }
+
+    $app.methods.saveSidebarSortOrder = async function () {
+        if (this.sidebarSortMethod1 === this.sidebarSortMethod2) {
+            this.sidebarSortMethod2 = '';
+        }
+        if (this.sidebarSortMethod1 === this.sidebarSortMethod3) {
+            this.sidebarSortMethod3 = '';
+        }
+        if (this.sidebarSortMethod2 === this.sidebarSortMethod3) {
+            this.sidebarSortMethod3 = '';
+        }
+        if (!this.sidebarSortMethod1) {
+            this.sidebarSortMethod2 = '';
+        }
+        if (!this.sidebarSortMethod2) {
+            this.sidebarSortMethod3 = '';
+        }
+        this.sidebarSortMethods = [
+            this.sidebarSortMethod1,
+            this.sidebarSortMethod2,
+            this.sidebarSortMethod3
+        ];
+        await configRepository.setString(
+            'VRCX_sidebarSortMethods',
+            JSON.stringify(this.sidebarSortMethods)
         );
-        await configRepository.setBool(
-            'orderFriendGroupPrivate',
-            this.orderFriendsGroupPrivate
-        );
-        await configRepository.setBool(
-            'orderFriendsGroupStatus',
-            this.orderFriendsGroupStatus
-        );
-        await configRepository.setBool(
-            'orderFriendGroupGPS',
-            this.orderFriendsGroupGPS
-        );
-        this.sortFriendsGroup0 = true;
-        this.sortFriendsGroup1 = true;
+        this.sortVIPFriends = true;
+        this.sortOnlineFriends = true;
+        this.sortActiveFriends = true;
+        this.sortOfflineFriends = true;
     };
     $app.data.discordActive = await configRepository.getBool(
         'discordActive',
@@ -17147,6 +17603,7 @@ speechSynthesis.getVoices();
         isHideAvatar: false,
         isShowAvatar: false,
         isInteractOff: false,
+        isMuteChat: false,
         isFavorite: false,
 
         $location: {},
@@ -17358,7 +17815,6 @@ speechSynthesis.getVoices();
         var D = $app.userDialog;
         if (
             D.visible === false ||
-            ref.$isDeleted ||
             (ref.targetUserId !== D.id &&
                 ref.sourceUserId !== this.currentUser.id)
         ) {
@@ -17372,6 +17828,8 @@ speechSynthesis.getVoices();
             D.isHideAvatar = true;
         } else if (ref.type === 'interactOff') {
             D.isInteractOff = true;
+        } else if (ref.type === 'muteChat') {
+            D.isMuteChat = true;
         }
         $app.$message({
             message: 'User moderated',
@@ -17397,6 +17855,8 @@ speechSynthesis.getVoices();
             D.isHideAvatar = false;
         } else if (ref.type === 'interactOff') {
             D.isInteractOff = false;
+        } else if (ref.type === 'muteChat') {
+            D.isMuteChat = false;
         }
     });
 
@@ -17514,9 +17974,9 @@ speechSynthesis.getVoices();
                     D.isBlock = false;
                     D.isMute = false;
                     D.isInteractOff = false;
+                    D.isMuteChat = false;
                     for (var ref of API.cachedPlayerModerations.values()) {
                         if (
-                            ref.$isDeleted === false &&
                             ref.targetUserId === D.id &&
                             ref.sourceUserId === API.currentUser.id
                         ) {
@@ -17528,6 +17988,8 @@ speechSynthesis.getVoices();
                                 D.isHideAvatar = true;
                             } else if (ref.type === 'interactOff') {
                                 D.isInteractOff = true;
+                            } else if (ref.type === 'muteChat') {
+                                D.isMuteChat = true;
                             }
                         }
                     }
@@ -17614,8 +18076,10 @@ speechSynthesis.getVoices();
                                         if (!D.dateFriended) {
                                             if (ref2.type === 'Unfriend') {
                                                 D.unFriended = true;
-                                                D.dateFriended =
-                                                    ref2.created_at;
+                                                if (!this.hideUnfriends) {
+                                                    D.dateFriended =
+                                                        ref2.created_at;
+                                                }
                                             }
                                             if (ref2.type === 'Friend') {
                                                 D.unFriended = false;
@@ -17625,7 +18089,8 @@ speechSynthesis.getVoices();
                                         }
                                         if (
                                             ref2.type === 'Friend' ||
-                                            ref2.type === 'Unfriend'
+                                            (ref2.type === 'Unfriend' &&
+                                                !this.hideUnfriends)
                                         ) {
                                             D.dateFriendedInfo.push(ref2);
                                         }
@@ -18017,10 +18482,12 @@ speechSynthesis.getVoices();
         isQuest: false,
         isIos: false,
         avatarScalingDisabled: false,
+        focusViewDisabled: false,
+        stickersDisabled: false,
         inCache: false,
         cacheSize: '',
-        fileCreatedAt: '',
-        fileSize: ''
+        bundleSizes: [],
+        lastUpdated: ''
     };
     $app.data.currentInstanceLocation = {};
 
@@ -18037,10 +18504,12 @@ speechSynthesis.getVoices();
                 isQuest: false,
                 isIos: false,
                 avatarScalingDisabled: false,
+                focusViewDisabled: false,
+                stickersDisabled: false,
                 inCache: false,
                 cacheSize: '',
-                fileCreatedAt: '',
-                fileSize: ''
+                bundleSizes: [],
+                lastUpdated: ''
             };
             this.currentInstanceLocation = {};
         } else if (instanceId !== this.currentInstanceLocation.tag) {
@@ -18051,10 +18520,12 @@ speechSynthesis.getVoices();
                 isQuest: false,
                 isIos: false,
                 avatarScalingDisabled: false,
+                focusViewDisabled: false,
+                stickersDisabled: false,
                 inCache: false,
                 cacheSize: '',
-                fileCreatedAt: '',
-                fileSize: ''
+                bundleSizes: [],
+                lastUpdated: ''
             };
             var L = API.parseLocation(instanceId);
             this.currentInstanceLocation = L;
@@ -18070,6 +18541,10 @@ speechSynthesis.getVoices();
                 this.currentInstanceWorld.isIos = isIos;
                 this.currentInstanceWorld.avatarScalingDisabled =
                     args.ref?.tags.includes('feature_avatar_scaling_disabled');
+                this.currentInstanceWorld.focusViewDisabled =
+                    args.ref?.tags.includes('feature_focus_view_disabled');
+                this.currentInstanceWorld.stickersDisabled =
+                    args.ref?.tags.includes('feature_stickers_disabled');
                 this.checkVRChatCache(args.ref).then((cacheInfo) => {
                     if (cacheInfo.Item1 > 0) {
                         this.currentInstanceWorld.inCache = true;
@@ -18078,12 +18553,9 @@ speechSynthesis.getVoices();
                         ).toFixed(2)} MB`;
                     }
                 });
-                this.getBundleDateSize(args.ref).then(
-                    ({ createdAt, fileSize }) => {
-                        this.currentInstanceWorld.fileCreatedAt = createdAt;
-                        this.currentInstanceWorld.fileSize = fileSize;
-                    }
-                );
+                this.getBundleDateSize(args.ref).then((bundleSizes) => {
+                    this.currentInstanceWorld.bundleSizes = bundleSizes;
+                });
                 return args;
             });
         } else {
@@ -18131,7 +18603,8 @@ speechSynthesis.getVoices();
             for (var unityPackage of unityPackages) {
                 if (
                     unityPackage.variant &&
-                    unityPackage.variant !== 'standard'
+                    unityPackage.variant !== 'standard' &&
+                    unityPackage.variant !== 'security'
                 ) {
                     continue;
                 }
@@ -18145,6 +18618,38 @@ speechSynthesis.getVoices();
             }
         }
         return { isPC, isQuest, isIos };
+    };
+
+    $app.methods.getPlatformInfo = function (unityPackages) {
+        var pc = {};
+        var android = {};
+        var ios = {};
+        if (typeof unityPackages === 'object') {
+            for (var unityPackage of unityPackages) {
+                if (
+                    unityPackage.variant &&
+                    unityPackage.variant !== 'standard' &&
+                    unityPackage.variant !== 'security'
+                ) {
+                    continue;
+                }
+                if (unityPackage.platform === 'standalonewindows') {
+                    pc = unityPackage;
+                } else if (unityPackage.platform === 'android') {
+                    android = unityPackage;
+                } else if (unityPackage.platform === 'ios') {
+                    ios = unityPackage;
+                }
+            }
+        }
+        return { pc, android, ios };
+    };
+
+    $app.methods.replaceVrcPackageUrl = function (url) {
+        if (!url) {
+            return '';
+        }
+        return url.replace('https://api.vrchat.cloud/', 'https://vrchat.com/');
     };
 
     $app.methods.selectCurrentInstanceRow = function (val) {
@@ -18525,6 +19030,18 @@ speechSynthesis.getVoices();
                     type: 'interactOff'
                 });
                 break;
+            case 'Unmute Chatbox':
+                API.deletePlayerModeration({
+                    moderated: userId,
+                    type: 'muteChat'
+                });
+                break;
+            case 'Mute Chatbox':
+                API.sendPlayerModeration({
+                    moderated: userId,
+                    type: 'muteChat'
+                });
+                break;
             case 'Report Hacking':
                 $app.reportUserForHacking(userId);
                 break;
@@ -18703,10 +19220,12 @@ speechSynthesis.getVoices();
         ref: {},
         isFavorite: false,
         avatarScalingDisabled: false,
+        focusViewDisabled: false,
+        stickersDisabled: false,
         rooms: [],
         treeData: [],
-        fileCreatedAt: '',
-        fileSize: '',
+        bundleSizes: [],
+        lastUpdated: '',
         inCache: false,
         cacheSize: 0,
         cacheLocked: false,
@@ -18716,7 +19235,8 @@ speechSynthesis.getVoices();
         timeSpent: 0,
         isPC: false,
         isQuest: false,
-        isIos: false
+        isIos: false,
+        hasPersistData: false
     };
 
     $app.data.ignoreWorldMemoSave = false;
@@ -18744,6 +19264,8 @@ speechSynthesis.getVoices();
         D.avatarScalingDisabled = ref.tags?.includes(
             'feature_avatar_scaling_disabled'
         );
+        D.focusViewDisabled = ref.tags?.includes('feature_focus_view_disabled');
+        D.stickersDisabled = ref.tags?.includes('feature_stickers_disabled');
         $app.applyWorldDialogInstances();
         for (var room of D.rooms) {
             if ($app.isRealInstance(room.tag)) {
@@ -18753,61 +19275,93 @@ speechSynthesis.getVoices();
                 });
             }
         }
-        if (D.fileSize === 'Loading') {
-            $app.getBundleDateSize(ref)
-                .then(({ createdAt, fileSize }) => {
-                    D.fileCreatedAt = createdAt;
-                    if (fileSize) {
-                        D.fileSize = fileSize;
-                    } else {
-                        D.fileSize = 'Error';
-                    }
-                })
-                .catch(() => {
-                    D.fileSize = 'Error';
-                });
+        if (D.bundleSizes.length === 0) {
+            $app.getBundleDateSize(ref).then((bundleSizes) => {
+                D.bundleSizes = bundleSizes;
+            });
         }
     });
 
     $app.methods.getBundleDateSize = async function (ref) {
-        var assetUrl = '';
-        var createdAt = '';
-        var fileSize = '';
+        var bundleSizes = [];
         for (let i = ref.unityPackages.length - 1; i > -1; i--) {
             var unityPackage = ref.unityPackages[i];
-            if (unityPackage.variant && unityPackage.variant !== 'standard') {
+            if (
+                unityPackage.variant &&
+                unityPackage.variant !== 'standard' &&
+                unityPackage.variant !== 'security'
+            ) {
                 continue;
             }
-            if (
-                unityPackage.platform === 'standalonewindows' &&
-                this.compareUnityVersion(unityPackage.unitySortNumber)
-            ) {
-                assetUrl = unityPackage.assetUrl;
-                break;
+            if (!this.compareUnityVersion(unityPackage.unitySortNumber)) {
+                continue;
             }
-        }
-        var fileId = extractFileId(assetUrl);
-        var fileVersion = parseInt(extractFileVersion(assetUrl), 10);
-        if (fileId) {
+
+            var platform = unityPackage.platform;
+            if (bundleSizes[platform]) {
+                continue;
+            }
+            var assetUrl = unityPackage.assetUrl;
+            var fileId = extractFileId(assetUrl);
+            var fileVersion = parseInt(extractFileVersion(assetUrl), 10);
+            if (!fileId) {
+                continue;
+            }
             var args = await API.getBundles(fileId);
-            if (
-                typeof args.json !== 'undefined' &&
-                typeof args.json.versions !== 'undefined'
-            ) {
-                var { versions } = args.json;
-                for (let i = versions.length - 1; i > -1; i--) {
-                    var version = versions[i];
-                    if (version.version === fileVersion) {
-                        createdAt = version.created_at;
-                        fileSize = `${(
-                            version.file.sizeInBytes / 1048576
-                        ).toFixed(2)} MB`;
-                        break;
+            if (!args?.json?.versions) {
+                continue;
+            }
+
+            var { versions } = args.json;
+            for (let j = versions.length - 1; j > -1; j--) {
+                var version = versions[j];
+                if (version.version === fileVersion) {
+                    var createdAt = version.created_at;
+                    var fileSize = `${(
+                        version.file.sizeInBytes / 1048576
+                    ).toFixed(2)} MB`;
+                    bundleSizes[platform] = {
+                        createdAt,
+                        fileSize
+                    };
+
+                    // update avatar dialog
+                    if (this.avatarDialog.id === ref.id) {
+                        this.avatarDialog.bundleSizes[platform] =
+                            bundleSizes[platform];
+                        if (
+                            this.avatarDialog.lastUpdated < version.created_at
+                        ) {
+                            this.avatarDialog.lastUpdated = version.created_at;
+                        }
                     }
+                    // update world dialog
+                    if (this.worldDialog.id === ref.id) {
+                        this.worldDialog.bundleSizes[platform] =
+                            bundleSizes[platform];
+                        if (this.worldDialog.lastUpdated < version.created_at) {
+                            this.worldDialog.lastUpdated = version.created_at;
+                        }
+                    }
+                    // update player list
+                    if (this.currentInstanceLocation.worldId === ref.id) {
+                        this.currentInstanceWorld.bundleSizes[platform] =
+                            bundleSizes[platform];
+
+                        if (
+                            this.currentInstanceWorld.lastUpdated <
+                            version.created_at
+                        ) {
+                            this.currentInstanceWorld.lastUpdated =
+                                version.created_at;
+                        }
+                    }
+                    break;
                 }
             }
         }
-        return { createdAt, fileSize };
+
+        return bundleSizes;
     };
 
     API.$on('FAVORITE', function (args) {
@@ -18838,8 +19392,8 @@ speechSynthesis.getVoices();
         D.id = L.worldId;
         D.$location = L;
         D.treeData = [];
-        D.fileCreatedAt = '';
-        D.fileSize = 'Loading';
+        D.bundleSizes = [];
+        D.lastUpdated = '';
         D.visible = true;
         D.loading = true;
         D.inCache = false;
@@ -18851,9 +19405,12 @@ speechSynthesis.getVoices();
         D.timeSpent = 0;
         D.isFavorite = false;
         D.avatarScalingDisabled = false;
+        D.focusViewDisabled = false;
+        D.stickersDisabled = false;
         D.isPC = false;
         D.isQuest = false;
         D.isIos = false;
+        D.hasPersistData = false;
         this.ignoreWorldMemoSave = true;
         D.memo = '';
         var LL = API.parseLocation(this.lastLocation.location);
@@ -18910,10 +19467,17 @@ speechSynthesis.getVoices();
                     D.avatarScalingDisabled = args.ref?.tags.includes(
                         'feature_avatar_scaling_disabled'
                     );
+                    D.focusViewDisabled = args.ref?.tags.includes(
+                        'feature_focus_view_disabled'
+                    );
+                    D.stickersDisabled = args.ref?.tags.includes(
+                        'feature_stickers_disabled'
+                    );
                     D.isPC = isPC;
                     D.isQuest = isQuest;
                     D.isIos = isIos;
                     this.updateVRChatWorldCache();
+                    API.hasWorldPersistData({ worldId: D.id });
                     if (args.cache) {
                         API.getWorld(args.params)
                             .catch((err) => {
@@ -19107,7 +19671,7 @@ speechSynthesis.getVoices();
             }
             // sort by number of users when no friends in instance
             if (a.users.length === 0 && b.users.length === 0) {
-                if (a.ref?.n_users < b.ref?.n_users) {
+                if (a.ref?.userCount < b.ref?.userCount) {
                     return 1;
                 }
                 return -1;
@@ -19265,7 +19829,7 @@ speechSynthesis.getVoices();
             }
             // sort by number of users when no friends in instance
             if (a.users.length === 0 && b.users.length === 0) {
-                if (a.ref?.n_users < b.ref?.n_users) {
+                if (a.ref?.userCount < b.ref?.userCount) {
                     return 1;
                 }
                 return -1;
@@ -19323,7 +19887,11 @@ speechSynthesis.getVoices();
                 this.showSetWorldTagsDialog();
                 break;
             case 'Download Unity Package':
-                this.openExternalLink(this.worldDialog.ref.unityPackageUrl);
+                this.openExternalLink(
+                    this.replaceVrcPackageUrl(
+                        this.worldDialog.ref.unityPackageUrl
+                    )
+                );
                 break;
             default:
                 this.$confirm(`Continue? ${command}`, 'Confirm', {
@@ -19379,6 +19947,18 @@ speechSynthesis.getVoices();
                                 }).then((args) => {
                                     this.$message({
                                         message: 'World has been unpublished',
+                                        type: 'success'
+                                    });
+                                    return args;
+                                });
+                                break;
+                            case 'Delete Persistent Data':
+                                API.deleteWorldPersistData({
+                                    worldId: D.id
+                                }).then((args) => {
+                                    this.$message({
+                                        message:
+                                            'Persistent data has been deleted',
                                         type: 'success'
                                     });
                                     return args;
@@ -19440,11 +20020,14 @@ speechSynthesis.getVoices();
         isBlocked: false,
         isQuestFallback: false,
         hasImposter: false,
+        imposterVersion: '',
         isPC: false,
         isQuest: false,
         isIos: false,
         treeData: [],
-        fileSize: '',
+        bundleSizes: [],
+        platformInfo: {},
+        lastUpdated: '',
         inCache: false,
         cacheSize: 0,
         cacheLocked: false,
@@ -19495,7 +20078,6 @@ speechSynthesis.getVoices();
         D.id = avatarId;
         D.fileAnalysis = {};
         D.treeData = [];
-        D.fileSize = '';
         D.inCache = false;
         D.cacheSize = 0;
         D.cacheLocked = false;
@@ -19505,7 +20087,14 @@ speechSynthesis.getVoices();
         D.isQuest = false;
         D.isIos = false;
         D.hasImposter = false;
-        D.isFavorite = API.cachedFavoritesByObjectId.has(avatarId);
+        D.imposterVersion = '';
+        D.lastUpdated = '';
+        D.bundleSizes = [];
+        D.platformInfo = {};
+        D.isFavorite =
+            API.cachedFavoritesByObjectId.has(avatarId) ||
+            (this.isLocalUserVrcplusSupporter() &&
+                this.localAvatarFavoritesList.includes(avatarId));
         D.isBlocked = API.cachedAvatarModerations.has(avatarId);
         this.ignoreAvatarMemoSave = true;
         D.memo = '';
@@ -19541,49 +20130,19 @@ speechSynthesis.getVoices();
                 D.isPC = isPC;
                 D.isQuest = isQuest;
                 D.isIos = isIos;
-                var assetUrl = '';
+                D.platformInfo = this.getPlatformInfo(args.ref.unityPackages);
                 for (let i = ref.unityPackages.length - 1; i > -1; i--) {
                     var unityPackage = ref.unityPackages[i];
-                    if (
-                        !assetUrl &&
-                        unityPackage.platform === 'standalonewindows' &&
-                        unityPackage.variant === 'standard' &&
-                        this.compareUnityVersion(unityPackage.unitySortNumber)
-                    ) {
-                        assetUrl = unityPackage.assetUrl;
-                    }
                     if (unityPackage.variant === 'impostor') {
                         D.hasImposter = true;
+                        D.imposterVersion = unityPackage.impostorizerVersion;
+                        break;
                     }
                 }
-                var fileId = extractFileId(assetUrl);
-                var fileVersion = parseInt(extractFileVersion(assetUrl), 10);
-                if (!fileId) {
-                    fileId = extractFileId(ref.assetUrl);
-                    fileVersion = parseInt(
-                        extractFileVersion(ref.assetUrl),
-                        10
-                    );
-                }
-                D.fileSize = '';
-                if (fileId) {
-                    D.fileSize = 'Loading';
-                    API.getBundles(fileId)
-                        .then((args2) => {
-                            var { versions } = args2.json;
-                            for (let i = versions.length - 1; i > -1; i--) {
-                                var version = versions[i];
-                                if (version.version === fileVersion) {
-                                    D.fileSize = `${(
-                                        version.file.sizeInBytes / 1048576
-                                    ).toFixed(2)} MB`;
-                                    break;
-                                }
-                            }
-                        })
-                        .catch(() => {
-                            D.fileSize = 'Error';
-                        });
+                if (D.bundleSizes.length === 0) {
+                    this.getBundleDateSize(ref).then((bundleSizes) => {
+                        D.bundleSizes = bundleSizes;
+                    });
                 }
             })
             .catch((err) => {
@@ -19598,6 +20157,28 @@ speechSynthesis.getVoices();
             if (D.id === memo.avatarId) {
                 this.ignoreAvatarMemoSave = true;
                 D.memo = memo.memo;
+            }
+        });
+    };
+
+    $app.methods.selectAvatarWithConfirmation = function (id) {
+        this.$confirm(`Continue? Select Avatar`, 'Confirm', {
+            confirmButtonText: 'Confirm',
+            cancelButtonText: 'Cancel',
+            type: 'info',
+            callback: (action) => {
+                if (action !== 'confirm') {
+                    return;
+                }
+                API.selectAvatar({
+                    avatarId: id
+                }).then((args) => {
+                    this.$message({
+                        message: 'Avatar changed',
+                        type: 'success'
+                    });
+                    return args;
+                });
             }
         });
     };
@@ -19627,7 +20208,11 @@ speechSynthesis.getVoices();
                 this.showSetAvatarTagsDialog(D.id);
                 break;
             case 'Download Unity Package':
-                this.openExternalLink(this.avatarDialog.ref.unityPackageUrl);
+                this.openExternalLink(
+                    this.replaceVrcPackageUrl(
+                        this.avatarDialog.ref.unityPackageUrl
+                    )
+                );
                 break;
             case 'Add Favorite':
                 this.showFavoriteDialog('avatar', D.id);
@@ -19830,7 +20415,8 @@ speechSynthesis.getVoices();
             for (var unityPackage of ref.unityPackages) {
                 if (
                     unityPackage.variant &&
-                    unityPackage.variant !== 'standard'
+                    unityPackage.variant !== 'standard' &&
+                    unityPackage.variant !== 'security'
                 ) {
                     continue;
                 }
@@ -19998,7 +20584,7 @@ speechSynthesis.getVoices();
 
     $app.methods.addFavoriteFriendsToInvite = function () {
         var D = this.inviteDialog;
-        for (var friend of this.friendsGroup0) {
+        for (var friend of this.vipFriends) {
             if (!D.userIds.includes(friend.id)) {
                 D.userIds.push(friend.id);
             }
@@ -20483,8 +21069,11 @@ speechSynthesis.getVoices();
             params.groupAccessType = D.groupAccessType;
             params.ownerId = D.groupId;
             params.queueEnabled = D.queueEnabled;
-            if (D.groupAccessType === 'member') {
+            if (D.groupAccessType === 'members') {
                 params.roleIds = D.roleIds;
+                params.canRequestInvite = true;
+            } else if (D.groupAccessType === 'plus') {
+                params.canRequestInvite = true;
             }
         }
         API.createInstance(params)
@@ -20723,6 +21312,8 @@ speechSynthesis.getVoices();
         contentTags: [],
         debugAllowed: false,
         avatarScalingDisabled: false,
+        focusViewDisabled: false,
+        stickersDisabled: false,
         contentHorror: false,
         contentGore: false,
         contentViolence: false,
@@ -20736,6 +21327,8 @@ speechSynthesis.getVoices();
         D.visible = true;
         D.debugAllowed = false;
         D.avatarScalingDisabled = false;
+        D.focusViewDisabled = false;
+        D.stickersDisabled = false;
         D.contentHorror = false;
         D.contentGore = false;
         D.contentViolence = false;
@@ -20773,6 +21366,12 @@ speechSynthesis.getVoices();
                     break;
                 case 'feature_avatar_scaling_disabled':
                     D.avatarScalingDisabled = true;
+                    break;
+                case 'feature_focus_view_disabled':
+                    D.focusViewDisabled = true;
+                    break;
+                case 'feature_stickers_disabled':
+                    D.stickersDisabled = true;
                     break;
             }
         });
@@ -20825,6 +21424,12 @@ speechSynthesis.getVoices();
         }
         if (D.avatarScalingDisabled) {
             tags.unshift('feature_avatar_scaling_disabled');
+        }
+        if (D.focusViewDisabled) {
+            tags.unshift('feature_focus_view_disabled');
+        }
+        if (D.stickersDisabled) {
+            tags.unshift('feature_stickers_disabled');
         }
         API.saveWorld({
             id: this.worldDialog.id,
@@ -21588,8 +22193,8 @@ speechSynthesis.getVoices();
         if (!files.length) {
             return;
         }
-        if (files[0].size >= 10000000) {
-            // 10MB
+        if (files[0].size >= 100000000) {
+            // 100MB
             $app.$message({
                 message: 'File size too large',
                 type: 'error'
@@ -21655,8 +22260,8 @@ speechSynthesis.getVoices();
         if (!files.length) {
             return;
         }
-        if (files[0].size >= 10000000) {
-            // 10MB
+        if (files[0].size >= 100000000) {
+            // 100MB
             $app.$message({
                 message: 'File size too large',
                 type: 'error'
@@ -21664,7 +22269,7 @@ speechSynthesis.getVoices();
             this.clearInviteImageUpload();
             return;
         }
-        if (!files[0].type.match(/image.png/)) {
+        if (!files[0].type.match(/image.*/)) {
             $app.$message({
                 message: "File isn't a png",
                 type: 'error'
@@ -21688,9 +22293,11 @@ speechSynthesis.getVoices();
 
     $app.methods.userOnlineFor = function (ctx) {
         if (ctx.ref.state === 'online' && ctx.ref.$online_for) {
-            return Date.now() - ctx.ref.$online_for;
+            return timeToText(Date.now() - ctx.ref.$online_for);
+        } else if (ctx.ref.state === 'active' && ctx.ref.$active_for) {
+            return timeToText(Date.now() - ctx.ref.$active_for);
         } else if (ctx.ref.$offline_for) {
-            return Date.now() - ctx.ref.$offline_for;
+            return timeToText(Date.now() - ctx.ref.$offline_for);
         }
         return '-';
     };
@@ -21698,6 +22305,8 @@ speechSynthesis.getVoices();
     $app.methods.userOnlineForTimestamp = function (ctx) {
         if (ctx.ref.state === 'online' && ctx.ref.$online_for) {
             return ctx.ref.$online_for;
+        } else if (ctx.ref.state === 'active' && ctx.ref.$active_for) {
+            return ctx.ref.$active_for;
         } else if (ctx.ref.$offline_for) {
             return ctx.ref.$offline_for;
         }
@@ -22419,14 +23028,27 @@ speechSynthesis.getVoices();
     $app.data.friendsListSearchFilters = [];
     $app.data.friendsListSelectAllCheckbox = false;
     $app.data.friendsListBulkUnfriendMode = false;
+    $app.data.friendsListBulkUnfriendForceUpdate = 0;
+
+    $app.methods.toggleFriendsListBulkUnfriendMode = function () {
+        if (!this.friendsListBulkUnfriendMode) {
+            this.friendsListTable.data.forEach((ref) => {
+                ref.$selected = false;
+            });
+        }
+    };
 
     $app.methods.showBulkUnfriendSelectionConfirm = function () {
-        var elementsTicked = 0;
-        for (var ctx of this.friendsListTable.data) {
-            if (ctx.$selected) {
-                elementsTicked++;
-            }
-        }
+        var pendingUnfriendList = this.friendsListTable.data.reduce(
+            (acc, ctx) => {
+                if (ctx.$selected) {
+                    acc.push(ctx.displayName);
+                }
+                return acc;
+            },
+            []
+        );
+        var elementsTicked = pendingUnfriendList.length;
         if (elementsTicked === 0) {
             return;
         }
@@ -22439,6 +23061,9 @@ speechSynthesis.getVoices();
                 confirmButtonText: 'Confirm',
                 cancelButtonText: 'Cancel',
                 type: 'info',
+                showInput: true,
+                inputType: 'textarea',
+                inputValue: pendingUnfriendList.join('\r\n'),
                 callback: (action) => {
                     if (action === 'confirm') {
                         this.bulkUnfriendSelection();
@@ -22493,14 +23118,16 @@ speechSynthesis.getVoices();
         }
         var results = [];
         if (this.friendsListSearch) {
-            var query = this.friendsListSearch.toUpperCase();
+            var query = this.friendsListSearch;
+            var cleanedQuery = removeWhitespace(query);
         }
+
         for (var ctx of this.friends.values()) {
             if (typeof ctx.ref === 'undefined') {
                 continue;
             }
-            if (typeof ctx.$selected === 'undefined') {
-                ctx.$selected = false;
+            if (typeof ctx.ref.$selected === 'undefined') {
+                ctx.ref.$selected = false;
             }
             if (this.friendsListSearchFilterVIP && !ctx.isVIP) {
                 continue;
@@ -22512,29 +23139,47 @@ speechSynthesis.getVoices();
                     filters.includes('Display Name') &&
                     ctx.ref.displayName
                 ) {
-                    match = String(ctx.ref.displayName)
-                        .toUpperCase()
-                        .includes(query);
+                    match =
+                        localeIncludes(
+                            ctx.ref.displayName,
+                            cleanedQuery,
+                            this.stringComparer
+                        ) ||
+                        localeIncludes(
+                            removeConfusables(ctx.ref.displayName),
+                            cleanedQuery,
+                            this.stringComparer
+                        );
                 }
                 if (!match && filters.includes('Memo') && ctx.memo) {
-                    match = String(ctx.memo).toUpperCase().includes(query);
+                    match = localeIncludes(
+                        ctx.memo,
+                        query,
+                        this.stringComparer
+                    );
                 }
                 if (!match && filters.includes('Bio') && ctx.ref.bio) {
-                    match = String(ctx.ref.bio).toUpperCase().includes(query);
+                    match = localeIncludes(
+                        ctx.ref.bio,
+                        query,
+                        this.stringComparer
+                    );
                 }
                 if (
                     !match &&
                     filters.includes('Status') &&
                     ctx.ref.statusDescription
                 ) {
-                    match = String(ctx.ref.statusDescription)
-                        .toUpperCase()
-                        .includes(query);
+                    match = localeIncludes(
+                        ctx.ref.statusDescription,
+                        query,
+                        this.stringComparer
+                    );
                 }
                 if (!match && filters.includes('Rank') && ctx.ref.$friendNum) {
                     match = String(ctx.ref.$trustLevel)
                         .toUpperCase()
-                        .includes(query);
+                        .includes(query.toUpperCase());
                 }
                 if (!match) {
                     continue;
@@ -22647,6 +23292,9 @@ speechSynthesis.getVoices();
     };
 
     $app.methods.sortAlphabetically = function (a, b, field) {
+        if (!a[field] || !b[field]) {
+            return 0;
+        }
         return a[field].toLowerCase().localeCompare(b[field].toLowerCase());
     };
 
@@ -22666,6 +23314,11 @@ speechSynthesis.getVoices();
 
     $app.methods.genMd5 = async function (file) {
         var response = await AppApi.MD5File(file);
+        return response;
+    };
+
+    $app.methods.resizeImageToFitLimits = async function (file) {
+        var response = await AppApi.ResizeImageToFitLimits(file);
         return response;
     };
 
@@ -22696,8 +23349,8 @@ speechSynthesis.getVoices();
             clearFile();
             return;
         }
-        if (files[0].size >= 10000000) {
-            // 10MB
+        if (files[0].size >= 100000000) {
+            // 100MB
             $app.$message({
                 message: 'File size too large',
                 type: 'error'
@@ -22705,7 +23358,7 @@ speechSynthesis.getVoices();
             clearFile();
             return;
         }
-        if (!files[0].type.match(/image.png/)) {
+        if (!files[0].type.match(/image.*/)) {
             $app.$message({
                 message: "File isn't a png",
                 type: 'error'
@@ -22717,7 +23370,8 @@ speechSynthesis.getVoices();
         this.changeAvatarImageDialogLoading = true;
         var r = new FileReader();
         r.onload = async function (file) {
-            var base64File = btoa(r.result);
+            var base64File = await $app.resizeImageToFitLimits(btoa(r.result));
+            // 10MB
             var fileMd5 = await $app.genMd5(base64File);
             var fileSizeInBytes = parseInt(file.total, 10);
             var base64SignatureFile = await $app.genSig(base64File);
@@ -23031,8 +23685,8 @@ speechSynthesis.getVoices();
             clearFile();
             return;
         }
-        if (files[0].size >= 10000000) {
-            // 10MB
+        if (files[0].size >= 100000000) {
+            // 100MB
             $app.$message({
                 message: 'File size too large',
                 type: 'error'
@@ -23040,7 +23694,7 @@ speechSynthesis.getVoices();
             clearFile();
             return;
         }
-        if (!files[0].type.match(/image.png/)) {
+        if (!files[0].type.match(/image.*/)) {
             $app.$message({
                 message: "File isn't a png",
                 type: 'error'
@@ -23052,7 +23706,8 @@ speechSynthesis.getVoices();
         this.changeWorldImageDialogLoading = true;
         var r = new FileReader();
         r.onload = async function (file) {
-            var base64File = btoa(r.result);
+            var base64File = await $app.resizeImageToFitLimits(btoa(r.result));
+            // 10MB
             var fileMd5 = await $app.genMd5(base64File);
             var fileSizeInBytes = parseInt(file.total, 10);
             var base64SignatureFile = await $app.genSig(base64File);
@@ -23362,21 +24017,6 @@ speechSynthesis.getVoices();
             this.$throw(0, 'Avatar image change failed', args.params.imageUrl);
         }
     });
-
-    API.setWorldImage = function (params) {
-        return this.call(`worlds/${params.id}`, {
-            method: 'PUT',
-            params
-        }).then((json) => {
-            var args = {
-                json,
-                params
-            };
-            this.$emit('WORLDIMAGE:SET', args);
-            this.$emit('WORLD', args);
-            return args;
-        });
-    };
 
     API.$on('WORLDIMAGE:SET', function (args) {
         $app.worldDialog.loading = false;
@@ -24413,9 +25053,14 @@ speechSynthesis.getVoices();
             return { Item1: -1, Item2: false, Item3: '' };
         }
         var assetUrl = '';
+        var variant = '';
         for (var i = ref.unityPackages.length - 1; i > -1; i--) {
             var unityPackage = ref.unityPackages[i];
-            if (unityPackage.variant && unityPackage.variant !== 'standard') {
+            if (
+                unityPackage.variant &&
+                unityPackage.variant !== 'standard' &&
+                unityPackage.variant !== 'security'
+            ) {
                 continue;
             }
             if (
@@ -24423,6 +25068,9 @@ speechSynthesis.getVoices();
                 this.compareUnityVersion(unityPackage.unitySortNumber)
             ) {
                 assetUrl = unityPackage.assetUrl;
+                if (unityPackage.variant !== 'standard') {
+                    variant = unityPackage.variant;
+                }
                 break;
             }
         }
@@ -24431,11 +25079,17 @@ speechSynthesis.getVoices();
         }
         var id = extractFileId(assetUrl);
         var version = parseInt(extractFileVersion(assetUrl), 10);
+        var variantVersion = parseInt(extractVariantVersion(assetUrl), 10);
         if (!id || !version) {
             return { Item1: -1, Item2: false, Item3: '' };
         }
 
-        return AssetBundleCacher.CheckVRChatCache(id, version);
+        return AssetBundleCacher.CheckVRChatCache(
+            id,
+            version,
+            variant,
+            variantVersion
+        );
     };
 
     API.getBundles = function (fileId) {
@@ -24523,7 +25177,11 @@ speechSynthesis.getVoices();
             case -16:
                 if (this.downloadCurrent.ref.id === 'VRCXUpdate') {
                     if (this.downloadCurrent.autoInstall) {
-                        workerTimers.setTimeout(() => this.restartVRCX(), 2000);
+                        var isUpgrade = true;
+                        workerTimers.setTimeout(
+                            () => this.restartVRCX(isUpgrade),
+                            2000
+                        );
                     } else {
                         this.downloadDialog.visible = false;
                         this.pendingVRCXInstall = this.downloadCurrent.ref.name;
@@ -24579,9 +25237,14 @@ speechSynthesis.getVoices();
 
     $app.methods.deleteVRChatCache = async function (ref) {
         var assetUrl = '';
+        var variant = '';
         for (var i = ref.unityPackages.length - 1; i > -1; i--) {
             var unityPackage = ref.unityPackages[i];
-            if (unityPackage.variant && unityPackage.variant !== 'standard') {
+            if (
+                unityPackage.variant &&
+                unityPackage.variant !== 'standard' &&
+                unityPackage.variant !== 'security'
+            ) {
                 continue;
             }
             if (
@@ -24589,12 +25252,21 @@ speechSynthesis.getVoices();
                 this.compareUnityVersion(unityPackage.unitySortNumber)
             ) {
                 assetUrl = unityPackage.assetUrl;
+                if (unityPackage.variant !== 'standard') {
+                    variant = unityPackage.variant;
+                }
                 break;
             }
         }
         var id = extractFileId(assetUrl);
         var version = parseInt(extractFileVersion(assetUrl), 10);
-        await AssetBundleCacher.DeleteCache(id, version);
+        var variantVersion = parseInt(extractVariantVersion(assetUrl), 10);
+        await AssetBundleCacher.DeleteCache(
+            id,
+            version,
+            variant,
+            variantVersion
+        );
         this.getVRChatCacheSize();
         this.updateVRChatWorldCache();
         this.updateVRChatAvatarCache();
@@ -24693,6 +25365,7 @@ speechSynthesis.getVoices();
 
     $app.methods.getBundleLocation = async function (input) {
         var assetUrl = input;
+        var variant = '';
         if (assetUrl) {
             // continue
         } else if (
@@ -24704,7 +25377,8 @@ speechSynthesis.getVoices();
                 var unityPackage = unityPackages[i];
                 if (
                     unityPackage.variant &&
-                    unityPackage.variant !== 'standard'
+                    unityPackage.variant !== 'standard' &&
+                    unityPackage.variant !== 'security'
                 ) {
                     continue;
                 }
@@ -24713,6 +25387,9 @@ speechSynthesis.getVoices();
                     this.compareUnityVersion(unityPackage.unitySortNumber)
                 ) {
                     assetUrl = unityPackage.assetUrl;
+                    if (unityPackage.variant !== 'standard') {
+                        variant = unityPackage.variant;
+                    }
                     break;
                 }
             }
@@ -24744,13 +25421,18 @@ speechSynthesis.getVoices();
         }
         var fileId = extractFileId(assetUrl);
         var fileVersion = parseInt(extractFileVersion(assetUrl), 10);
+        var variantVersion = parseInt(extractVariantVersion(assetUrl), 10);
         var assetLocation = await AssetBundleCacher.GetVRChatCacheFullLocation(
             fileId,
-            fileVersion
+            fileVersion,
+            variant,
+            variantVersion
         );
         var cacheInfo = await AssetBundleCacher.CheckVRChatCache(
             fileId,
-            fileVersion
+            fileVersion,
+            variant,
+            variantVersion
         );
         var inCache = false;
         if (cacheInfo.Item1 > 0) {
@@ -24800,7 +25482,8 @@ speechSynthesis.getVoices();
         this.userFavoriteWorlds = [];
         var worldLists = [];
         var params = {
-            ownerId: userId
+            ownerId: userId,
+            n: 100
         };
         var json = await API.call('favorite/groups', {
             method: 'GET',
@@ -24895,6 +25578,10 @@ speechSynthesis.getVoices();
         this.userGroups.groups = args.json;
         for (var i = 0; i < args.json.length; ++i) {
             var group = args.json[i];
+            if (!group?.id) {
+                console.error('getUserGroups, group ID is missing', group);
+                continue;
+            }
             if (group.ownerId === userId) {
                 this.userGroups.ownGroups.unshift(group);
             }
@@ -24932,8 +25619,8 @@ speechSynthesis.getVoices();
     $app.methods.sortCurrentUserGroups = function () {
         var groupList = [];
         var sortGroups = function (a, b) {
-            var aIndex = groupList.indexOf(a.id);
-            var bIndex = groupList.indexOf(b.id);
+            var aIndex = groupList.indexOf(a?.id);
+            var bIndex = groupList.indexOf(b?.id);
             if (aIndex === -1 && bIndex === -1) {
                 return 0;
             }
@@ -24960,6 +25647,8 @@ speechSynthesis.getVoices();
     $app.data.galleryDialogVisible = false;
     $app.data.galleryDialogGalleryLoading = false;
     $app.data.galleryDialogIconsLoading = false;
+    $app.data.galleryDialogEmojisLoading = false;
+    $app.data.galleryDialogStickersLoading = false;
 
     API.$on('LOGIN', function () {
         $app.galleryTable = [];
@@ -24971,6 +25660,7 @@ speechSynthesis.getVoices();
         this.refreshGalleryTable();
         this.refreshVRCPlusIconsTable();
         this.refreshEmojiTable();
+        this.refreshStickerTable();
         workerTimers.setTimeout(() => this.setGalleryTab(pageNum), 100);
     };
 
@@ -25063,8 +25753,8 @@ speechSynthesis.getVoices();
         if (!files.length) {
             return;
         }
-        if (files[0].size >= 10000000) {
-            // 10MB
+        if (files[0].size >= 100000000) {
+            // 100MB
             $app.$message({
                 message: 'File size too large',
                 type: 'error'
@@ -25124,6 +25814,117 @@ speechSynthesis.getVoices();
     });
 
     // #endregion
+    // #region | Sticker
+    API.$on('LOGIN', function () {
+        $app.stickerTable = [];
+    });
+
+    $app.methods.refreshStickerTable = function () {
+        this.galleryDialogStickersLoading = true;
+        var params = {
+            n: 100,
+            tag: 'sticker'
+        };
+        API.getFileList(params);
+    };
+
+    API.$on('FILES:LIST', function (args) {
+        if (args.params.tag === 'sticker') {
+            $app.stickerTable = args.json.reverse();
+            $app.galleryDialogStickersLoading = false;
+        }
+    });
+
+    $app.methods.deleteSticker = function (fileId) {
+        API.deleteFile(fileId).then((args) => {
+            API.$emit('STICKER:DELETE', args);
+            return args;
+        });
+    };
+
+    API.$on('STICKER:DELETE', function (args) {
+        var array = $app.stickerTable;
+        var { length } = array;
+        for (var i = 0; i < length; ++i) {
+            if (args.fileId === array[i].id) {
+                array.splice(i, 1);
+                break;
+            }
+        }
+    });
+
+    $app.methods.onFileChangeSticker = function (e) {
+        var clearFile = function () {
+            if (document.querySelector('#StickerUploadButton')) {
+                document.querySelector('#StickerUploadButton').value = '';
+            }
+        };
+        var files = e.target.files || e.dataTransfer.files;
+        if (!files.length) {
+            return;
+        }
+        if (files[0].size >= 100000000) {
+            // 100MB
+            $app.$message({
+                message: 'File size too large',
+                type: 'error'
+            });
+            clearFile();
+            return;
+        }
+        if (!files[0].type.match(/image.*/)) {
+            $app.$message({
+                message: "File isn't an image",
+                type: 'error'
+            });
+            clearFile();
+            return;
+        }
+        var r = new FileReader();
+        r.onload = function () {
+            var params = {
+                tag: 'sticker',
+                maskTag: 'square'
+            };
+            var base64Body = btoa(r.result);
+            API.uploadSticker(base64Body, params).then((args) => {
+                $app.$message({
+                    message: 'Sticker uploaded',
+                    type: 'success'
+                });
+                return args;
+            });
+        };
+        r.readAsBinaryString(files[0]);
+        clearFile();
+    };
+
+    $app.methods.displayStickerUpload = function () {
+        document.getElementById('StickerUploadButton').click();
+    };
+
+    API.uploadSticker = function (imageData, params) {
+        return this.call('file/image', {
+            uploadImage: true,
+            postData: JSON.stringify(params),
+            imageData
+        }).then((json) => {
+            var args = {
+                json,
+                params
+            };
+            this.$emit('STICKER:ADD', args);
+            return args;
+        });
+    };
+
+    API.$on('STICKER:ADD', function (args) {
+        if (Object.keys($app.stickerTable).length !== 0) {
+            $app.stickerTable.unshift(args.json);
+        }
+    });
+
+    // #endregion
     // #region | Emoji
 
     API.$on('LOGIN', function () {
@@ -25131,7 +25932,7 @@ speechSynthesis.getVoices();
     });
 
     $app.methods.refreshEmojiTable = function () {
-        this.galleryDialogIconsLoading = true;
+        this.galleryDialogEmojisLoading = true;
         var params = {
             n: 100,
             tag: 'emoji'
@@ -25142,7 +25943,7 @@ speechSynthesis.getVoices();
     API.$on('FILES:LIST', function (args) {
         if (args.params.tag === 'emoji') {
             $app.emojiTable = args.json.reverse();
-            $app.galleryDialogIconsLoading = false;
+            $app.galleryDialogEmojisLoading = false;
         }
     });
 
@@ -25174,8 +25975,8 @@ speechSynthesis.getVoices();
         if (!files.length) {
             return;
         }
-        if (files[0].size >= 10000000) {
-            // 10MB
+        if (files[0].size >= 100000000) {
+            // 100MB
             $app.$message({
                 message: 'File size too large',
                 type: 'error'
@@ -25512,8 +26313,8 @@ speechSynthesis.getVoices();
         }
     };
 
-    $app.methods.restartVRCX = function () {
-        AppApi.RestartApplication();
+    $app.methods.restartVRCX = function (isUpgrade) {
+        AppApi.RestartApplication(isUpgrade);
     };
 
     $app.methods.loadBranchVersions = async function () {
@@ -25541,13 +26342,6 @@ speechSynthesis.getVoices();
             return;
         }
         for (var release of json) {
-            if (
-                release.target_commitish === 'PyPyDanceCompanion' ||
-                release.prerelease
-            ) {
-                // skip old branch name and prerelease builds
-                continue;
-            }
             for (var asset of release.assets) {
                 if (
                     (asset.content_type === 'application/x-msdownload' ||
@@ -26074,7 +26868,8 @@ speechSynthesis.getVoices();
                             groupOnNameplate: user.groupOnNameplate,
                             showGroupBadgeToOthers: user.showGroupBadgeToOthers,
                             showSocialRank: user.showSocialRank,
-                            useImpostorAsFallback: user.useImpostorAsFallback
+                            useImpostorAsFallback: user.useImpostorAsFallback,
+                            platform: user.platform
                         });
                     }
                 }
@@ -26131,7 +26926,7 @@ speechSynthesis.getVoices();
                 var data = input.replace(`import/${type}/`, '');
                 if (type === 'avatar') {
                     this.showAvatarImportDialog();
-                    this.worldImportDialog.input = data;
+                    this.avatarImportDialog.input = data;
                 } else if (type === 'world') {
                     this.showWorldImportDialog();
                     this.worldImportDialog.input = data;
@@ -26654,6 +27449,7 @@ speechSynthesis.getVoices();
             return false;
         }
         switch (instanceId) {
+            case 'offline:offline':
             case 'offline':
             case 'private':
             case 'traveling':
@@ -26727,11 +27523,46 @@ speechSynthesis.getVoices();
         }
     };
 
-    $app.methods.setCurrentUserLocation = function (location) {
+    $app.methods.setCurrentUserLocation = async function (location) {
         API.currentUser.$location_at = Date.now();
         API.currentUser.$travelingToTime = Date.now();
         API.currentUser.$locationTag = location;
         this.updateCurrentUserLocation();
+
+        // janky gameLog support for Quest
+        if (this.isGameRunning) {
+            // with the current state of things, lets not run this if we don't need to
+            return;
+        }
+        var lastLocation = '';
+        for (var i = this.gameLogSessionTable.length - 1; i > -1; i--) {
+            var item = this.gameLogSessionTable[i];
+            if (item.type === 'Location') {
+                lastLocation = item.location;
+                break;
+            }
+        }
+        if (this.isRealInstance(location) && lastLocation !== location) {
+            var dt = new Date().toJSON();
+            var L = API.parseLocation(location);
+            var entry = {
+                created_at: dt,
+                type: 'Location',
+                location,
+                worldId: L.worldId,
+                worldName: await this.getWorldName(L.worldId),
+                groupName: await this.getGroupName(L.groupId),
+                time: 0
+            };
+            database.addGamelogLocationToDatabase(entry);
+            this.queueGameLogNoty(entry);
+            this.addGameLog(entry);
+            this.addInstanceJoinHistory(location, dt);
+
+            this.applyUserDialogLocation();
+            this.applyWorldDialogInstances();
+            this.applyGroupDialogInstances();
+        }
     };
 
     $app.data.avatarHistory = new Set();
@@ -26793,7 +27624,7 @@ speechSynthesis.getVoices();
     );
 
     $app.methods.updateDatabaseVersion = async function () {
-        var databaseVersion = 8;
+        var databaseVersion = 9;
         if (this.databaseVersion < databaseVersion) {
             if (this.databaseVersion) {
                 var msgBox = this.$message({
@@ -26815,6 +27646,7 @@ speechSynthesis.getVoices();
                 await database.updateTableForGroupNames(); // alter tables to include group name
                 await database.fixBrokenNotifications(); // fix notifications being null
                 await database.fixBrokenGroupChange(); // fix spam group left & name change
+                await database.fixCancelFriendRequestTypo(); // fix CancelFriendRequst typo
                 await database.vacuum(); // succ
                 await database.setWal(); // https://www.sqlite.org/wal.html
                 await configRepository.setInt(
@@ -27094,6 +27926,7 @@ speechSynthesis.getVoices();
         avatarIdList: new Set(),
         errors: '',
         avatarImportFavoriteGroup: null,
+        avatarImportLocalFavoriteGroup: null,
         importProgress: 0,
         importProgressTotal: 0
     };
@@ -27178,7 +28011,14 @@ speechSynthesis.getVoices();
 
     $app.methods.selectAvatarImportGroup = function (group) {
         var D = this.avatarImportDialog;
+        D.avatarImportLocalFavoriteGroup = null;
         D.avatarImportFavoriteGroup = group;
+    };
+
+    $app.methods.selectAvatarImportLocalGroup = function (group) {
+        var D = this.avatarImportDialog;
+        D.avatarImportFavoriteGroup = null;
+        D.avatarImportLocalFavoriteGroup = group;
     };
 
     $app.methods.cancelAvatarImport = function () {
@@ -27188,10 +28028,10 @@ speechSynthesis.getVoices();
 
     $app.methods.importAvatarImportTable = async function () {
         var D = this.avatarImportDialog;
-        D.loading = true;
-        if (!D.avatarImportFavoriteGroup) {
+        if (!D.avatarImportFavoriteGroup && !D.avatarImportLocalFavoriteGroup) {
             return;
         }
+        D.loading = true;
         var data = [...this.avatarImportTable.data].reverse();
         D.importProgressTotal = data.length;
         try {
@@ -27200,7 +28040,17 @@ speechSynthesis.getVoices();
                     break;
                 }
                 var ref = data[i];
-                await this.addFavoriteAvatar(ref, D.avatarImportFavoriteGroup);
+                if (D.avatarImportFavoriteGroup) {
+                    await this.addFavoriteAvatar(
+                        ref,
+                        D.avatarImportFavoriteGroup
+                    );
+                } else if (D.avatarImportLocalFavoriteGroup) {
+                    this.addLocalAvatarFavorite(
+                        ref.id,
+                        D.avatarImportLocalFavoriteGroup
+                    );
+                }
                 removeFromArray(this.avatarImportTable.data, ref);
                 D.avatarIdList.delete(ref.id);
                 D.importProgress++;
@@ -27219,9 +28069,11 @@ speechSynthesis.getVoices();
         $app.resetAvatarImport();
         $app.avatarImportDialog.visible = false;
         $app.avatarImportFavoriteGroup = null;
+        $app.avatarImportLocalFavoriteGroup = null;
 
         $app.avatarExportDialogVisible = false;
         $app.avatarExportFavoriteGroup = null;
+        $app.avatarExportLocalFavoriteGroup = null;
     });
 
     // #endregion
@@ -27231,12 +28083,14 @@ speechSynthesis.getVoices();
     $app.data.avatarExportDialogVisible = false;
     $app.data.avatarExportContent = '';
     $app.data.avatarExportFavoriteGroup = null;
+    $app.data.avatarExportLocalFavoriteGroup = null;
 
     $app.methods.showAvatarExportDialog = function () {
         this.$nextTick(() =>
             adjustDialogZ(this.$refs.avatarExportDialogRef.$el)
         );
         this.avatarExportFavoriteGroup = null;
+        this.avatarExportLocalFavoriteGroup = null;
         this.updateAvatarExportDialog();
         this.avatarExportDialogVisible = true;
     };
@@ -27249,23 +28103,54 @@ speechSynthesis.getVoices();
             return str;
         };
         var lines = ['AvatarID,Name'];
-        API.favoriteAvatarGroups.forEach((group) => {
-            if (
-                !this.avatarExportFavoriteGroup ||
-                this.avatarExportFavoriteGroup === group
-            ) {
-                $app.favoriteAvatars.forEach((ref) => {
-                    if (group.key === ref.groupKey) {
-                        lines.push(`${_(ref.id)},${_(ref.name)}`);
-                    }
-                });
+        if (this.avatarExportFavoriteGroup) {
+            API.favoriteAvatarGroups.forEach((group) => {
+                if (
+                    !this.avatarExportFavoriteGroup ||
+                    this.avatarExportFavoriteGroup === group
+                ) {
+                    $app.favoriteAvatars.forEach((ref) => {
+                        if (group.key === ref.groupKey) {
+                            lines.push(`${_(ref.id)},${_(ref.name)}`);
+                        }
+                    });
+                }
+            });
+        } else if (this.avatarExportLocalFavoriteGroup) {
+            var favoriteGroup =
+                this.localAvatarFavorites[this.avatarExportLocalFavoriteGroup];
+            if (!favoriteGroup) {
+                return;
             }
-        });
+            for (var i = 0; i < favoriteGroup.length; ++i) {
+                var ref = favoriteGroup[i];
+                lines.push(`${_(ref.id)},${_(ref.name)}`);
+            }
+        } else {
+            // export all
+            this.favoriteAvatars.forEach((ref1) => {
+                lines.push(`${_(ref1.id)},${_(ref1.name)}`);
+            });
+            for (var i = 0; i < this.localAvatarFavoritesList.length; ++i) {
+                var avatarId = this.localAvatarFavoritesList[i];
+                var ref2 = API.cachedAvatars.get(avatarId);
+                if (typeof ref2 !== 'undefined') {
+                    lines.push(`${_(ref2.id)},${_(ref2.name)}`);
+                }
+            }
+        }
         this.avatarExportContent = lines.join('\n');
     };
 
     $app.methods.selectAvatarExportGroup = function (group) {
         this.avatarExportFavoriteGroup = group;
+        this.avatarExportLocalFavoriteGroup = null;
+        this.updateAvatarExportDialog();
+    };
+
+    $app.methods.selectAvatarExportLocalGroup = function (group) {
+        this.avatarExportLocalFavoriteGroup = group;
+        this.avatarExportFavoriteGroup = null;
         this.updateAvatarExportDialog();
     };
 
@@ -28085,6 +28970,366 @@ speechSynthesis.getVoices();
     };
 
     // #endregion
+    // #region | App: Local Avatar Favorites
+
+    $app.methods.isLocalUserVrcplusSupporter = function () {
+        return API.currentUser.$isVRCPlus;
+    };
+
+    $app.data.localAvatarFavoriteGroups = [];
+    $app.data.localAvatarFavoritesList = [];
+    $app.data.localAvatarFavorites = {};
+
+    $app.methods.addLocalAvatarFavorite = function (avatarId, group) {
+        if (this.hasLocalAvatarFavorite(avatarId, group)) {
+            return;
+        }
+        var ref = API.cachedAvatars.get(avatarId);
+        if (typeof ref === 'undefined') {
+            return;
+        }
+        if (!this.localAvatarFavoritesList.includes(avatarId)) {
+            this.localAvatarFavoritesList.push(avatarId);
+        }
+        if (!this.localAvatarFavorites[group]) {
+            this.localAvatarFavorites[group] = [];
+        }
+        if (!this.localAvatarFavoriteGroups.includes(group)) {
+            this.localAvatarFavoriteGroups.push(group);
+        }
+        this.localAvatarFavorites[group].unshift(ref);
+        database.addAvatarToCache(ref);
+        database.addAvatarToFavorites(avatarId, group);
+        if (
+            this.favoriteDialog.visible &&
+            this.favoriteDialog.objectId === avatarId
+        ) {
+            this.updateFavoriteDialog(avatarId);
+        }
+        if (this.avatarDialog.visible && this.avatarDialog.id === avatarId) {
+            this.avatarDialog.isFavorite = true;
+        }
+    };
+
+    $app.methods.removeLocalAvatarFavorite = function (avatarId, group) {
+        var favoriteGroup = this.localAvatarFavorites[group];
+        for (var i = 0; i < favoriteGroup.length; ++i) {
+            if (favoriteGroup[i].id === avatarId) {
+                favoriteGroup.splice(i, 1);
+            }
+        }
+
+        // remove from cache if no longer in favorites
+        var avatarInFavorites = false;
+        for (var i = 0; i < this.localAvatarFavoriteGroups.length; ++i) {
+            var groupName = this.localAvatarFavoriteGroups[i];
+            if (!this.localAvatarFavorites[groupName] || group === groupName) {
+                continue;
+            }
+            for (
+                var j = 0;
+                j < this.localAvatarFavorites[groupName].length;
+                ++j
+            ) {
+                var id = this.localAvatarFavorites[groupName][j].id;
+                if (id === avatarId) {
+                    avatarInFavorites = true;
+                    break;
+                }
+            }
+        }
+        if (!avatarInFavorites) {
+            removeFromArray(this.localAvatarFavoritesList, avatarId);
+            if (!this.avatarHistory.has(avatarId)) {
+                database.removeAvatarFromCache(avatarId);
+            }
+        }
+        database.removeAvatarFromFavorites(avatarId, group);
+        if (
+            this.favoriteDialog.visible &&
+            this.favoriteDialog.objectId === avatarId
+        ) {
+            this.updateFavoriteDialog(avatarId);
+        }
+        if (this.avatarDialog.visible && this.avatarDialog.id === avatarId) {
+            this.avatarDialog.isFavorite =
+                API.cachedFavoritesByObjectId.has(avatarId);
+        }
+
+        // update UI
+        this.sortLocalAvatarFavorites();
+    };
+
+    API.$on('AVATAR', function (args) {
+        if ($app.localAvatarFavoritesList.includes(args.ref.id)) {
+            // update db cache
+            database.addAvatarToCache(args.ref);
+        }
+    });
+
+    API.$on('LOGIN', function () {
+        $app.getLocalAvatarFavorites();
+    });
+
+    $app.methods.getLocalAvatarFavorites = async function () {
+        this.localAvatarFavoriteGroups = [];
+        this.localAvatarFavoritesList = [];
+        this.localAvatarFavorites = {};
+        var avatarCache = await database.getAvatarCache();
+        for (var i = 0; i < avatarCache.length; ++i) {
+            var ref = avatarCache[i];
+            if (!API.cachedAvatars.has(ref.id)) {
+                API.applyAvatar(ref);
+            }
+        }
+        var favorites = await database.getAvatarFavorites();
+        for (var i = 0; i < favorites.length; ++i) {
+            var favorite = favorites[i];
+            if (!this.localAvatarFavoritesList.includes(favorite.avatarId)) {
+                this.localAvatarFavoritesList.push(favorite.avatarId);
+            }
+            if (!this.localAvatarFavorites[favorite.groupName]) {
+                this.localAvatarFavorites[favorite.groupName] = [];
+            }
+            if (!this.localAvatarFavoriteGroups.includes(favorite.groupName)) {
+                this.localAvatarFavoriteGroups.push(favorite.groupName);
+            }
+            var ref = API.cachedAvatars.get(favorite.avatarId);
+            if (typeof ref === 'undefined') {
+                ref = {
+                    id: favorite.avatarId
+                };
+            }
+            this.localAvatarFavorites[favorite.groupName].unshift(ref);
+        }
+        if (this.localAvatarFavoriteGroups.length === 0) {
+            // default group
+            this.localAvatarFavorites.Favorites = [];
+            this.localAvatarFavoriteGroups.push('Favorites');
+        }
+        this.sortLocalAvatarFavorites();
+    };
+
+    $app.methods.hasLocalAvatarFavorite = function (avatarId, group) {
+        var favoriteGroup = this.localAvatarFavorites[group];
+        if (!favoriteGroup) {
+            return false;
+        }
+        for (var i = 0; i < favoriteGroup.length; ++i) {
+            if (favoriteGroup[i].id === avatarId) {
+                return true;
+            }
+        }
+        return false;
+    };
+
+    $app.methods.getLocalAvatarFavoriteGroupLength = function (group) {
+        var favoriteGroup = this.localAvatarFavorites[group];
+        if (!favoriteGroup) {
+            return 0;
+        }
+        return favoriteGroup.length;
+    };
+
+    $app.methods.promptNewLocalAvatarFavoriteGroup = function () {
+        this.$prompt(
+            $t('prompt.new_local_favorite_group.description'),
+            $t('prompt.new_local_favorite_group.header'),
+            {
+                distinguishCancelAndClose: true,
+                confirmButtonText: $t('prompt.new_local_favorite_group.ok'),
+                cancelButtonText: $t('prompt.new_local_favorite_group.cancel'),
+                inputPattern: /\S+/,
+                inputErrorMessage: $t(
+                    'prompt.new_local_favorite_group.input_error'
+                ),
+                callback: (action, instance) => {
+                    if (action === 'confirm' && instance.inputValue) {
+                        this.newLocalAvatarFavoriteGroup(instance.inputValue);
+                    }
+                }
+            }
+        );
+    };
+
+    $app.methods.newLocalAvatarFavoriteGroup = function (group) {
+        if (this.localAvatarFavoriteGroups.includes(group)) {
+            $app.$message({
+                message: $t('prompt.new_local_favorite_group.message.error', {
+                    name: group
+                }),
+                type: 'error'
+            });
+            return;
+        }
+        if (!this.localAvatarFavorites[group]) {
+            this.localAvatarFavorites[group] = [];
+        }
+        if (!this.localAvatarFavoriteGroups.includes(group)) {
+            this.localAvatarFavoriteGroups.push(group);
+        }
+        this.sortLocalAvatarFavorites();
+    };
+
+    $app.methods.promptLocalAvatarFavoriteGroupRename = function (group) {
+        this.$prompt(
+            $t('prompt.local_favorite_group_rename.description'),
+            $t('prompt.local_favorite_group_rename.header'),
+            {
+                distinguishCancelAndClose: true,
+                confirmButtonText: $t(
+                    'prompt.local_favorite_group_rename.save'
+                ),
+                cancelButtonText: $t(
+                    'prompt.local_favorite_group_rename.cancel'
+                ),
+                inputPattern: /\S+/,
+                inputErrorMessage: $t(
+                    'prompt.local_favorite_group_rename.input_error'
+                ),
+                inputValue: group,
+                callback: (action, instance) => {
+                    if (action === 'confirm' && instance.inputValue) {
+                        this.renameLocalAvatarFavoriteGroup(
+                            instance.inputValue,
+                            group
+                        );
+                    }
+                }
+            }
+        );
+    };
+
+    $app.methods.renameLocalAvatarFavoriteGroup = function (newName, group) {
+        if (this.localAvatarFavoriteGroups.includes(newName)) {
+            $app.$message({
+                message: $t(
+                    'prompt.local_favorite_group_rename.message.error',
+                    { name: newName }
+                ),
+                type: 'error'
+            });
+            return;
+        }
+        this.localAvatarFavoriteGroups.push(newName);
+        this.localAvatarFavorites[newName] = this.localAvatarFavorites[group];
+
+        removeFromArray(this.localAvatarFavoriteGroups, group);
+        delete this.localAvatarFavorites[group];
+        database.renameAvatarFavoriteGroup(newName, group);
+        this.sortLocalAvatarFavorites();
+    };
+
+    $app.methods.promptLocalAvatarFavoriteGroupDelete = function (group) {
+        this.$confirm(`Delete Group? ${group}`, 'Confirm', {
+            confirmButtonText: 'Confirm',
+            cancelButtonText: 'Cancel',
+            type: 'info',
+            callback: (action) => {
+                if (action === 'confirm') {
+                    this.deleteLocalAvatarFavoriteGroup(group);
+                }
+            }
+        });
+    };
+
+    $app.methods.sortLocalAvatarFavorites = function () {
+        this.localAvatarFavoriteGroups.sort();
+        if (!this.sortFavorites) {
+            for (var i = 0; i < this.localAvatarFavoriteGroups.length; ++i) {
+                var group = this.localAvatarFavoriteGroups[i];
+                if (this.localAvatarFavorites[group]) {
+                    this.localAvatarFavorites[group].sort(compareByName);
+                }
+            }
+        }
+    };
+
+    $app.methods.deleteLocalAvatarFavoriteGroup = function (group) {
+        // remove from cache if no longer in favorites
+        var avatarIdRemoveList = new Set();
+        var favoriteGroup = this.localAvatarFavorites[group];
+        for (var i = 0; i < favoriteGroup.length; ++i) {
+            avatarIdRemoveList.add(favoriteGroup[i].id);
+        }
+
+        removeFromArray(this.localAvatarFavoriteGroups, group);
+        delete this.localAvatarFavorites[group];
+        database.deleteAvatarFavoriteGroup(group);
+
+        for (var i = 0; i < this.localAvatarFavoriteGroups.length; ++i) {
+            var groupName = this.localAvatarFavoriteGroups[i];
+            if (!this.localAvatarFavorites[groupName]) {
+                continue;
+            }
+            for (
+                var j = 0;
+                j < this.localAvatarFavorites[groupName].length;
+                ++j
+            ) {
+                var avatarId = this.localAvatarFavorites[groupName][j].id;
+                if (avatarIdRemoveList.has(avatarId)) {
+                    avatarIdRemoveList.delete(avatarId);
+                    break;
+                }
+            }
+        }
+
+        avatarIdRemoveList.forEach((id) => {
+            removeFromArray(this.localAvatarFavoritesList, id);
+            if (!this.avatarHistory.has(id)) {
+                database.removeAvatarFromCache(id);
+            }
+        });
+    };
+
+    $app.data.avatarFavoriteSearch = '';
+    $app.data.avatarFavoriteSearchResults = [];
+
+    $app.methods.searchAvatarFavorites = function () {
+        var search = this.avatarFavoriteSearch.toLowerCase();
+        if (search.length < 3) {
+            this.avatarFavoriteSearchResults = [];
+            return;
+        }
+
+        var results = [];
+        for (var i = 0; i < this.localAvatarFavoriteGroups.length; ++i) {
+            var group = this.localAvatarFavoriteGroups[i];
+            if (!this.localAvatarFavorites[group]) {
+                continue;
+            }
+            for (var j = 0; j < this.localAvatarFavorites[group].length; ++j) {
+                var ref = this.localAvatarFavorites[group][j];
+                if (!ref || !ref.id) {
+                    continue;
+                }
+                if (
+                    ref.name.toLowerCase().includes(search) ||
+                    ref.authorName.toLowerCase().includes(search)
+                ) {
+                    results.push(ref);
+                }
+            }
+        }
+
+        for (var i = 0; i < this.favoriteAvatars.length; ++i) {
+            var ref = this.favoriteAvatars[i].ref;
+            if (!ref) {
+                continue;
+            }
+            if (
+                ref.name.toLowerCase().includes(search) ||
+                ref.authorName.toLowerCase().includes(search)
+            ) {
+                results.push(ref);
+            }
+        }
+
+        this.avatarFavoriteSearchResults = results;
+    };
+
+    // #endregion
     // #region | Local Favorite Friends
 
     $app.data.localFavoriteFriends = new Set();
@@ -28126,54 +29371,15 @@ speechSynthesis.getVoices();
                 continue;
             }
             if (ctx.isVIP) {
-                removeFromArray(this.friendsGroup1_, ctx);
-                removeFromArray(this.friendsGroupB_, ctx);
-                this.sortFriendsGroup0 = true;
-                this.friendsGroup0_.push(ctx);
-                this.friendsGroupA_.unshift(ctx);
+                removeFromArray(this.onlineFriends_, ctx);
+                this.vipFriends_.push(ctx);
+                this.sortVIPFriends = true;
             } else {
-                removeFromArray(this.friendsGroup0_, ctx);
-                removeFromArray(this.friendsGroupA_, ctx);
-                this.sortFriendsGroup1 = true;
-                this.friendsGroup1_.push(ctx);
-                this.friendsGroupB_.unshift(ctx);
+                removeFromArray(this.vipFriends_, ctx);
+                this.onlineFriends_.push(ctx);
+                this.sortOnlineFriends = true;
             }
         }
-    };
-
-    // #endregion
-    // #region | App: pending offline timer
-
-    $app.methods.promptSetPendingOffline = function () {
-        this.$prompt(
-            $t('prompt.pending_offline_delay.description'),
-            $t('prompt.pending_offline_delay.header'),
-            {
-                distinguishCancelAndClose: true,
-                confirmButtonText: $t('prompt.pending_offline_delay.save'),
-                cancelButtonText: $t('prompt.pending_offline_delay.cancel'),
-                inputValue: this.pendingOfflineDelay / 1000,
-                inputPattern: /\d+$/,
-                inputErrorMessage: $t(
-                    'prompt.pending_offline_delay.input_error'
-                ),
-                callback: async (action, instance) => {
-                    if (
-                        action === 'confirm' &&
-                        instance.inputValue &&
-                        !isNaN(instance.inputValue)
-                    ) {
-                        this.pendingOfflineDelay = Math.trunc(
-                            Number(instance.inputValue) * 1000
-                        );
-                        await configRepository.setInt(
-                            'VRCX_pendingOfflineDelay',
-                            this.pendingOfflineDelay
-                        );
-                    }
-                }
-            }
-        );
     };
 
     // #endregion
@@ -28407,16 +29613,13 @@ speechSynthesis.getVoices();
         // workerTimers.setTimeout(this.instanceQueueTimeout, 3600000);
     };
 
-    // $app.methods.instanceQueueTimeout = function () {
-    //     // remove instance from queue after 1hour of inactivity
-    //     API.queuedInstances.forEach((ref) => {
-    //         // 59mins
-    //         if (Date.now() - ref.updatedAt > 3540000) {
-    //             ref.$msgBox.close();
-    //             API.queuedInstances.delete(ref.location);
-    //         }
-    //     });
-    // };
+    $app.methods.instanceQueueClear = function () {
+        // remove all instances from queue
+        API.queuedInstances.forEach((ref) => {
+            ref.$msgBox.close();
+            API.queuedInstances.delete(ref.location);
+        });
+    };
 
     /**
      * @param {{ groupId: string }} params
@@ -30145,7 +31348,6 @@ speechSynthesis.getVoices();
                     });
                     var ref = API.applyGroup(args.json);
                     API.currentUserGroups.set(groupId, ref);
-                    console.log(`Fetched group ${ref.name}`);
                 } catch (err) {
                     console.error(err);
                 }
@@ -30165,6 +31367,8 @@ speechSynthesis.getVoices();
                 if (typeof ref !== 'undefined') {
                     json.user = ref;
                     json.$displayName = ref.displayName;
+                } else {
+                    json.$displayName = json.user?.displayName;
                 }
             }
         }
@@ -31211,6 +32415,7 @@ speechSynthesis.getVoices();
         configRepository.setString('VRCX_appLanguage', language);
         this.applyLanguageStrings();
         this.updateVRConfigVars();
+        this._stringComparer = undefined;
     };
 
     // #endregion
@@ -31373,7 +32578,11 @@ speechSynthesis.getVoices();
         var assetUrl = '';
         for (let i = D.ref.unityPackages.length - 1; i > -1; i--) {
             var unityPackage = D.ref.unityPackages[i];
-            if (unityPackage.variant && unityPackage.variant !== 'standard') {
+            if (
+                unityPackage.variant &&
+                unityPackage.variant !== 'standard' &&
+                unityPackage.variant !== 'security'
+            ) {
                 continue;
             }
             if (
@@ -32655,6 +33864,7 @@ speechSynthesis.getVoices();
             text: D.text,
             roleIds: D.roleIds,
             visibility: D.visibility,
+            sendNotification: D.sendNotification,
             imageId: null
         };
         if (this.gallerySelectDialog.selectedFileId) {
@@ -32853,6 +34063,130 @@ speechSynthesis.getVoices();
             .replace(/_/g, ' ')
             .replace(/\b\w/g, (l) => l.toUpperCase());
     };
+
+    // #endregion
+
+    // #region proxy settings
+
+    $app.methods.promptProxySettings = function () {
+        this.$prompt(
+            $t('prompt.proxy_settings.description'),
+            $t('prompt.proxy_settings.header'),
+            {
+                distinguishCancelAndClose: true,
+                confirmButtonText: $t('prompt.proxy_settings.restart'),
+                cancelButtonText: $t('prompt.proxy_settings.close'),
+                inputValue: this.proxyServer,
+                inputPlaceholder: $t('prompt.proxy_settings.placeholder'),
+                callback: async (action, instance) => {
+                    this.proxyServer = instance.inputValue;
+                    await VRCXStorage.Set('VRCX_ProxyServer', this.proxyServer);
+                    await VRCXStorage.Flush();
+                    await new Promise((resolve) => {
+                        workerTimers.setTimeout(resolve, 100);
+                    });
+                    if (action === 'confirm') {
+                        var isUpgrade = false;
+                        this.restartVRCX(isUpgrade);
+                    }
+                }
+            }
+        );
+    };
+
+    // #endregion
+
+    // #region instance join history
+
+    $app.data.instanceJoinHistory = new Map();
+
+    API.$on('LOGIN', function () {
+        $app.instanceJoinHistory = new Map();
+        $app.getInstanceJoinHistory();
+    });
+
+    $app.methods.getInstanceJoinHistory = async function () {
+        this.instanceJoinHistory = await database.getInstanceJoinHistory();
+    };
+
+    $app.methods.addInstanceJoinHistory = function (location, dateTime) {
+        if (!location || !dateTime) {
+            return;
+        }
+
+        if (this.instanceJoinHistory.has(location)) {
+            this.instanceJoinHistory.delete(location);
+        }
+
+        var epoch = new Date(dateTime).getTime();
+        this.instanceJoinHistory.set(location, epoch);
+    };
+
+    // #endregion
+
+    // #region persistent data
+
+    /**
+    * @param {{
+            worldId: string
+    }} params
+     * @returns {Promise<{json: any, params}>}
+     */
+    API.deleteWorldPersistData = function (params) {
+        return this.call(
+            `users/${this.currentUser.id}/${params.worldId}/persist`,
+            {
+                method: 'DELETE'
+            }
+        ).then((json) => {
+            var args = {
+                json,
+                params
+            };
+            this.$emit('WORLD:PERSIST:DELETE', args);
+            return args;
+        });
+    };
+
+    /**
+    * @param {{
+            worldId: string
+    }} params
+     * @returns {Promise<{json: any, params}>}
+     */
+    API.hasWorldPersistData = function (params) {
+        return this.call(
+            `users/${this.currentUser.id}/${params.worldId}/persist/exists`,
+            {
+                method: 'GET'
+            }
+        ).then((json) => {
+            var args = {
+                json,
+                params
+            };
+            this.$emit('WORLD:PERSIST:HAS', args);
+            return args;
+        });
+    };
+
+    API.$on('WORLD:PERSIST:HAS', function (args) {
+        if (
+            args.params.worldId === $app.worldDialog.id &&
+            $app.worldDialog.visible
+        ) {
+            $app.worldDialog.hasPersistData = args.json !== false;
+        }
+    });
+
+    API.$on('WORLD:PERSIST:DELETE', function (args) {
+        if (
+            args.params.worldId === $app.worldDialog.id &&
+            $app.worldDialog.visible
+        ) {
+            $app.worldDialog.hasPersistData = false;
+        }
+    });
 
     // #endregion
 

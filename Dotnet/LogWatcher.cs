@@ -202,7 +202,6 @@ namespace VRCX
                             if (line.Length <= 36 ||
                                 line[31] != '-')
                             {
-                                ParseDesktopModeOld(fileInfo, line);
                                 continue;
                             }
 
@@ -257,7 +256,10 @@ namespace VRCX
                                     ParseLogStringDownload(fileInfo, logContext, line, offset) ||
                                     ParseLogImageDownload(fileInfo, logContext, line, offset) ||
                                     ParseVoteKick(fileInfo, logContext, line, offset) ||
-                                    ParseFailedToJoin(fileInfo, logContext, line, offset))
+                                    ParseFailedToJoin(fileInfo, logContext, line, offset) ||
+                                    ParseInstanceResetWarning(fileInfo, logContext, line, offset) ||
+                                    ParseVoteKickInitiation(fileInfo, logContext, line, offset) ||
+                                    ParseVoteKickSuccess(fileInfo, logContext, line, offset))
                                 {
                                 }
                             }
@@ -453,6 +455,8 @@ namespace VRCX
             // 2021.12.12 11:47:22 Log        -  [Behaviour] OnPlayerJoined:Unnamed
             // 2021.12.12 11:53:14 Log        -  [Behaviour] OnPlayerLeftRoom
 
+            // Future logs will be formatted like this: [Behaviour] OnPlayerJoined Natsumi-sama (usr_032383a7-748c-4fb2-94e4-bcb928e5de6b)
+
             if (line.Contains("[Behaviour] OnPlayerJoined") && !line.Contains("] OnPlayerJoined:"))
             {
                 var lineOffset = line.LastIndexOf("] OnPlayerJoined");
@@ -462,14 +466,15 @@ namespace VRCX
                 if (lineOffset > line.Length)
                     return true;
 
-                var userDisplayName = line.Substring(lineOffset);
+                var userInfo = ParseUserInfo(line.Substring(lineOffset));
 
                 AppendLog(new[]
                 {
                     fileInfo.Name,
                     ConvertLogTimeToISO8601(line),
                     "player-joined",
-                    userDisplayName
+                    userInfo.DisplayName,
+                    userInfo.UserId
                 });
 
                 return true;
@@ -484,14 +489,15 @@ namespace VRCX
                 if (lineOffset > line.Length)
                     return true;
 
-                var userDisplayName = line.Substring(lineOffset);
+                var userInfo = ParseUserInfo(line.Substring(lineOffset));
 
                 AppendLog(new[]
                 {
                     fileInfo.Name,
                     ConvertLogTimeToISO8601(line),
                     "player-left",
-                    userDisplayName
+                    userInfo.DisplayName,
+                    userInfo.UserId
                 });
 
                 return true;
@@ -588,13 +594,15 @@ namespace VRCX
         {
             // 2021.04.08 06:37:45 Error -  [Video Playback] ERROR: Video unavailable
             // 2021.04.08 06:40:07 Error -  [Video Playback] ERROR: Private video
+            
+            // 2024.07.31 22:28:47 Error      -  [AVProVideo] Error: Loading failed.  File not found, codec not supported, video resolution too high or insufficient system resources.
+            // 2024.07.31 23:04:15 Error      -  [AVProVideo] Error: Loading failed.  File not found, codec not supported, video resolution too high or insufficient system resources.
 
-            if (string.Compare(line, offset, "[Video Playback] ERROR: ", 0, 24, StringComparison.Ordinal) != 0)
-                return false;
-
-            var data = line.Substring(offset + 24);
-            if (data == logContext.LastVideoError)
-                return true;
+            if (line.Contains("[Video Playback] ERROR: "))
+            {
+                var data = line.Substring(offset + 24);
+                if (data == logContext.LastVideoError)
+                    return true;
             logContext.LastVideoError = data;
 
             AppendLog(new[]
@@ -605,7 +613,28 @@ namespace VRCX
                 "VideoError: " + data
             });
 
-            return true;
+                return true;
+            }
+            
+            if (line.Contains("[AVProVideo] Error: "))
+            {
+                var data = line.Substring(offset + 20);
+                if (data == logContext.LastVideoError)
+                    return true;
+                logContext.LastVideoError = data;
+
+                AppendLog(new[]
+                {
+                    fileInfo.Name,
+                    ConvertLogTimeToISO8601(line),
+                    "event",
+                    "VideoError: " + data
+                });
+
+                return true;
+            }
+
+            return false;
         }
 
         private bool ParseLogWorldVRCX(FileInfo fileInfo, LogContext logContext, string line, int offset)
@@ -1006,8 +1035,9 @@ namespace VRCX
         private bool ParseApplicationQuit(FileInfo fileInfo, LogContext logContext, string line, int offset)
         {
             // 2022.06.12 01:51:46 Log        -  VRCApplication: OnApplicationQuit at 1603.499
-
-            if (string.Compare(line, offset, "VRCApplication: OnApplicationQuit at ", 0, 37, StringComparison.Ordinal) != 0)
+            // 2024.10.23 21:18:34 Log        -  VRCApplication: HandleApplicationQuit at 936.5161
+            if (string.Compare(line, offset, "VRCApplication: OnApplicationQuit at ", 0, 37, StringComparison.Ordinal) != 0 &&
+                string.Compare(line, offset, "VRCApplication: HandleApplicationQuit at ", 0, 41, StringComparison.Ordinal) != 0)
                 return false;
 
             AppendLog(new[]
@@ -1028,9 +1058,11 @@ namespace VRCX
 
             // 2023.04.22 16:52:28 Log        -  Initializing VRSDK.
             // 2023.04.22 16:52:29 Log        -  StartVRSDK: Open VR Loader
+            
+            // 2024.07.26 01:48:56 Log        -  STEAMVR HMD Model: Index
 
-            if (string.Compare(line, offset, "OpenVR initialized!", 0, 19, StringComparison.Ordinal) != 0 &&
-                string.Compare(line, offset, "Initializing VRSDK.", 0, 19, StringComparison.Ordinal) != 0)
+            if (string.Compare(line, offset, "Initializing VRSDK.", 0, 19, StringComparison.Ordinal) != 0 &&
+                string.Compare(line, offset, "STEAMVR HMD Model: ", 0, 20, StringComparison.Ordinal) != 0)
                 return false;
 
             AppendLog(new[]
@@ -1048,23 +1080,6 @@ namespace VRCX
             // 2023.04.22 16:54:18 Log        -  VR Disabled
 
             if (string.Compare(line, offset, "VR Disabled", 0, 11, StringComparison.Ordinal) != 0)
-                return false;
-
-            AppendLog(new[]
-            {
-                fileInfo.Name,
-                ConvertLogTimeToISO8601(line),
-                "desktop-mode"
-            });
-
-            return true;
-        }
-
-        private bool ParseDesktopModeOld(FileInfo fileInfo, string line)
-        {
-            //    XR Device: None
-
-            if (string.Compare(line, 0, "    XR Device: None", 0, 19, StringComparison.Ordinal) != 0)
                 return false;
 
             AppendLog(new[]
@@ -1183,6 +1198,63 @@ namespace VRCX
             return true;
         }
 
+        private bool ParseInstanceResetWarning(FileInfo fileInfo, LogContext logContext, string line, int offset)
+        {
+            // 2024.08.30 01:43:40 Log        -  [ModerationManager] This instance will be reset in 60 minutes due to its age.
+            if (!line.Contains("[ModerationManager] This instance will be reset in "))
+                return false;
+
+            int index = line.IndexOf("[ModerationManager] This instance will be reset in ") + 20;
+
+            AppendLog(new[]
+            {
+                fileInfo.Name,
+                ConvertLogTimeToISO8601(line),
+                "event",
+                line[index..]
+            });
+
+            return true;
+        }
+
+        private bool ParseVoteKickInitiation(FileInfo fileInfo, LogContext logContext, string line, int offset)
+        {
+            // 2024.08.29 02:04:47 Log        -  [ModerationManager] A vote kick has been initiated against בורקס במאווררים 849d, do you agree?
+            if (!line.Contains("[ModerationManager] A vote kick has been initiated against "))
+                return false;
+
+            int index = line.IndexOf("[ModerationManager] A vote kick has been initiated against ") + 20;
+
+            AppendLog(new[]
+            {
+                fileInfo.Name,
+                ConvertLogTimeToISO8601(line),
+                "event",
+                line[index..]
+            });
+
+            return true;
+        }
+
+        private bool ParseVoteKickSuccess(FileInfo fileInfo, LogContext logContext, string line, int offset)
+        {
+            // 2024.08.29 02:05:21 Log        -  [ModerationManager] Vote to kick בורקס במאווררים 849d succeeded
+            if (!line.Contains("[ModerationManager] Vote to kick "))
+                return false;
+
+            int index = line.IndexOf("[ModerationManager] Vote to kick ") + 20;
+
+            AppendLog(new[]
+            {
+                fileInfo.Name,
+                ConvertLogTimeToISO8601(line),
+                "event",
+                line[index..]
+            });
+
+            return true;
+        }
+
         public string[][] Get()
         {
             Update();
@@ -1216,6 +1288,26 @@ namespace VRCX
             }
 
             return new string[][] { };
+        }
+
+        private static (string DisplayName, string UserId) ParseUserInfo(string userInfo)
+        {
+            string userDisplayName;
+            string userId;
+
+            int pos = userInfo.LastIndexOf(" (");
+            if (pos >= 0)
+            {
+                userDisplayName = userInfo.Substring(0, pos);
+                userId = userInfo.Substring(pos + 2, userInfo.LastIndexOf(')') - (pos + 2));
+            }
+            else
+            {
+                userDisplayName = userInfo;
+                userId = null;
+            }
+
+            return (userDisplayName, userId);
         }
 
         private class LogContext

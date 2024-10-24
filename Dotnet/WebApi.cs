@@ -9,12 +9,19 @@ using System.Threading;
 using System.Threading.Tasks;
 using Newtonsoft.Json;
 using Newtonsoft.Json.Linq;
+using Cookie = System.Net.Cookie;
+using System.Windows;
 
 namespace VRCX
 {
     public class WebApi
     {
         public static readonly WebApi Instance;
+        
+        public static bool ProxySet;
+        public static string ProxyUrl = "";
+        public static IWebProxy Proxy = WebRequest.DefaultWebProxy;
+        
         public CookieContainer _cookieContainer;
         private bool _cookieDirty;
         private Timer _timer;
@@ -45,8 +52,37 @@ namespace VRCX
 
         internal void Init()
         {
+            SetProxy();
             LoadCookies();
             _timer.Change(1000, 1000);
+        }
+
+        private void SetProxy()
+        {
+            if (!string.IsNullOrEmpty(StartupArgs.LaunchArguments.ProxyUrl))
+                ProxyUrl = StartupArgs.LaunchArguments.ProxyUrl;
+
+            if (string.IsNullOrEmpty(ProxyUrl))
+            {
+                var proxyUrl = VRCXStorage.Instance.Get("VRCX_ProxyServer");
+                if (!string.IsNullOrEmpty(proxyUrl))
+                    ProxyUrl = proxyUrl;
+            }
+
+            if (string.IsNullOrEmpty(ProxyUrl))
+                return;
+
+            try
+            {
+                ProxySet = true;
+                Proxy = new WebProxy(ProxyUrl);
+            }
+            catch (UriFormatException)
+            {
+                VRCXStorage.Instance.Set("VRCX_ProxyServer", string.Empty);
+                MessageBox.Show("The proxy server URI you used is invalid.\nVRCX will close, please correct the proxy URI.", "Invalid Proxy URI", MessageBoxButton.OK);
+                Environment.Exit(0);
+            }
         }
 
         internal void Exit()
@@ -91,6 +127,10 @@ namespace VRCX
             if (_cookieDirty == false)
             {
                 return;
+            }
+            foreach (Cookie cookie in _cookieContainer.GetAllCookies())
+            {
+                cookie.Expires = DateTime.MaxValue;
             }
             try
             {
@@ -139,6 +179,10 @@ namespace VRCX
 
         private static async Task LegacyImageUpload(HttpWebRequest request, IDictionary<string, object> options)
         {
+            if (ProxySet)
+                request.Proxy = Proxy;
+
+            request.AutomaticDecompression = DecompressionMethods.All;
             request.Method = "POST";
             string boundary = "---------------------------" + DateTime.Now.Ticks.ToString("x");
             request.ContentType = "multipart/form-data; boundary=" + boundary;
@@ -156,7 +200,7 @@ namespace VRCX
                 }
             }
             var imageData = options["imageData"] as string;
-            byte[] fileToUpload = Convert.FromBase64CharArray(imageData.ToCharArray(), 0, imageData.Length);
+            byte[] fileToUpload = AppApi.Instance.ResizeImageToFitLimits(Convert.FromBase64String(imageData));
             string fileFormKey = "image";
             string fileName = "image.png";
             string fileMimeType = "image/png";
@@ -183,6 +227,10 @@ namespace VRCX
 
         private static async Task UploadFilePut(HttpWebRequest request, IDictionary<string, object> options)
         {
+            if (ProxySet)
+                request.Proxy = Proxy;
+
+            request.AutomaticDecompression = DecompressionMethods.All;
             request.Method = "PUT";
             request.ContentType = options["fileMIME"] as string;
             var fileData = options["fileData"] as string;
@@ -197,6 +245,10 @@ namespace VRCX
         
         private static async Task ImageUpload(HttpWebRequest request, IDictionary<string, object> options)
         {
+            if (ProxySet)
+                request.Proxy = Proxy;
+
+            request.AutomaticDecompression = DecompressionMethods.All;
             request.Method = "POST";
             string boundary = "---------------------------" + DateTime.Now.Ticks.ToString("x");
             request.ContentType = "multipart/form-data; boundary=" + boundary;
@@ -217,7 +269,8 @@ namespace VRCX
                 }
             }
             var imageData = options["imageData"] as string;
-            byte[] fileToUpload = Convert.FromBase64CharArray(imageData.ToCharArray(), 0, imageData.Length);
+            byte[] fileToUpload = AppApi.Instance.ResizeImageToFitLimits(Convert.FromBase64String(imageData));
+
             string fileFormKey = "file";
             string fileName = "blob";
             string fileMimeType = "image/png";
@@ -248,10 +301,16 @@ namespace VRCX
         {
             try
             {
+#pragma warning disable SYSLIB0014 // Type or member is obsolete
                 var request = WebRequest.CreateHttp((string)options["url"]);
+#pragma warning restore SYSLIB0014 // Type or member is obsolete
+                if (ProxySet)
+                    request.Proxy = Proxy;
+                
                 request.CookieContainer = _cookieContainer;
                 request.KeepAlive = true;
                 request.UserAgent = Program.Version;
+                request.AutomaticDecompression = DecompressionMethods.All;
 
                 if (options.TryGetValue("headers", out object headers))
                 {

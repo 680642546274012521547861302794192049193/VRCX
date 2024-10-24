@@ -60,6 +60,75 @@ namespace VRCX
             }
         }
 
+        public string ResizeImageToFitLimits(string base64data)
+        {
+            return Convert.ToBase64String(ResizeImageToFitLimits(Convert.FromBase64String(base64data)));
+        }
+
+        public byte[] ResizeImageToFitLimits(byte[] imageData, int maxWidth = 2000, int maxHeight = 2000, long maxSize = 10_000_000)
+        {
+            using var fileMemoryStream = new MemoryStream(imageData);
+            var image = new Bitmap(fileMemoryStream);
+            
+            // for APNG, check if image is png format and less than maxSize
+            if (image.RawFormat.Equals(System.Drawing.Imaging.ImageFormat.Png) &&
+                imageData.Length < maxSize &&
+                image.Width <= maxWidth &&
+                image.Height <= maxHeight)
+            {
+                return imageData;
+            }
+            
+            if (image.Width > maxWidth)
+            {
+                var sizingFactor = image.Width / (double)maxWidth;
+                var newHeight = (int)Math.Round(image.Height / sizingFactor);
+                image = new Bitmap(image, maxWidth, newHeight);
+            }
+            if (image.Height > maxHeight)
+            {
+                var sizingFactor = image.Height / (double)maxHeight;
+                var newWidth = (int)Math.Round(image.Width / sizingFactor);
+                image = new Bitmap(image, newWidth, maxHeight);
+            }
+
+            SaveToFileToUpload();
+            for (int i = 0; i < 250 && imageData.Length > maxSize; i++)
+            {
+                SaveToFileToUpload();
+                if (imageData.Length < maxSize)
+                    break;
+                
+                int newWidth;
+                int newHeight;
+                if (image.Width > image.Height)
+                {
+                    newWidth = image.Width - 25;
+                    newHeight = (int)Math.Round(image.Height / (image.Width / (double)newWidth));
+                }
+                else
+                {
+                    newHeight = image.Height - 25;
+                    newWidth = (int)Math.Round(image.Width / (image.Height / (double)newHeight));
+                }
+                image = new Bitmap(image, newWidth, newHeight);
+            }
+
+            if (imageData.Length > maxSize)
+            {
+                throw new Exception("Failed to get image into target filesize.");
+            }
+
+            return imageData;
+
+            void SaveToFileToUpload()
+            {
+                using var imageSaveMemoryStream = new MemoryStream();
+                image.Save(imageSaveMemoryStream, System.Drawing.Imaging.ImageFormat.Png);
+                imageData = imageSaveMemoryStream.ToArray();
+            }
+        }
+
         /// <summary>
         /// Computes the signature of the file represented by the specified base64-encoded string using the librsync library.
         /// </summary>
@@ -183,30 +252,61 @@ namespace VRCX
         /// <param name="Image">The optional image to display in the notification.</param>
         public void DesktopNotification(string BoldText, string Text = "", string Image = "")
         {
-            ToastContentBuilder builder = new ToastContentBuilder();
-            
-            if (Uri.TryCreate(Image, UriKind.Absolute, out Uri uri))
-                builder.AddAppLogoOverride(uri);
+            try
+            {
+                ToastContentBuilder builder = new ToastContentBuilder();
 
-            if (!string.IsNullOrEmpty(BoldText))
-                builder.AddText(BoldText);
-            
-            if (!string.IsNullOrEmpty(Text))
-                builder.AddText(Text);
+                if (Uri.TryCreate(Image, UriKind.Absolute, out Uri uri))
+                    builder.AddAppLogoOverride(uri);
 
-            builder.Show();
+                if (!string.IsNullOrEmpty(BoldText))
+                    builder.AddText(BoldText);
+
+                if (!string.IsNullOrEmpty(Text))
+                    builder.AddText(Text);
+
+                builder.Show();
+            }
+            catch (System.AccessViolationException ex)
+            {
+                logger.Warn(ex, "Unable to send desktop notification");
+            }
+            catch (Exception ex)
+            {
+                logger.Error(ex, "Unknown error when sending desktop notification");
+            }
         }
 
         /// <summary>
-        /// Restarts the VRCX application for an update by launching a new process with the "/Upgrade" argument and exiting the current process.
+        /// Restarts the VRCX application for an update by launching a new process with the upgrade argument and exiting the current process.
         /// </summary>
-        public void RestartApplication()
+        public void RestartApplication(bool isUpgrade)
         {
-            var VRCXProcess = new Process();
-            VRCXProcess.StartInfo.FileName = Path.Combine(Program.BaseDirectory, "VRCX.exe");
-            VRCXProcess.StartInfo.UseShellExecute = false;
-            VRCXProcess.StartInfo.Arguments = "/Upgrade";
-            VRCXProcess.Start();
+            var args = new List<string>();
+            
+            if (isUpgrade)
+                args.Add(StartupArgs.VrcxLaunchArguments.IsUpgradePrefix);
+
+            if (StartupArgs.LaunchArguments.IsDebug)
+                args.Add(StartupArgs.VrcxLaunchArguments.IsDebugPrefix);
+
+            if (!string.IsNullOrWhiteSpace(StartupArgs.LaunchArguments.ConfigDirectory))
+                args.Add($"{StartupArgs.VrcxLaunchArguments.ConfigDirectoryPrefix}={StartupArgs.LaunchArguments.ConfigDirectory}");
+
+            if (!string.IsNullOrWhiteSpace(StartupArgs.LaunchArguments.ProxyUrl))
+                args.Add($"{StartupArgs.VrcxLaunchArguments.ProxyUrlPrefix}={StartupArgs.LaunchArguments.ProxyUrl}");
+
+            var vrcxProcess = new Process
+            {
+                StartInfo = new ProcessStartInfo
+                {
+                    FileName = Path.Combine(Program.BaseDirectory, "VRCX.exe"),
+                    Arguments = string.Join(' ', args),
+                    UseShellExecute = true,
+                    WorkingDirectory = Program.BaseDirectory
+                }
+            };
+            vrcxProcess.Start();
             Environment.Exit(0);
         }
 
@@ -276,8 +376,8 @@ namespace VRCX
         /// <returns>The launch command.</returns>
         public string GetLaunchCommand()
         {
-            var command = StartupArgs.LaunchCommand;
-            StartupArgs.LaunchCommand = string.Empty;
+            var command = StartupArgs.LaunchArguments.LaunchCommand;
+            StartupArgs.LaunchArguments.LaunchCommand = string.Empty;
             return command;
         }
 

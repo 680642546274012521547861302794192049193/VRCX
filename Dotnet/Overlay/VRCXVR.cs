@@ -16,6 +16,10 @@ using SharpDX.Direct3D11;
 using SharpDX.DXGI;
 using Valve.VR;
 using Device = SharpDX.Direct3D11.Device;
+using Device1 = SharpDX.Direct3D11.Device1;
+using Device2 = SharpDX.Direct3D11.Device2;
+using Device3 = SharpDX.Direct3D11.Device3;
+using Device4 = SharpDX.Direct3D11.Device4;
 
 namespace VRCX
 {
@@ -42,6 +46,7 @@ namespace VRCX
         private Texture2D _texture2;
         private Thread _thread;
         private bool _wristOverlayActive;
+        private DateTime _nextOverlayUpdate;
         public bool IsHmdAfk { get; private set; }
 
         static VRCXVR()
@@ -70,8 +75,8 @@ namespace VRCX
         {
             var thread = _thread;
             _thread = null;
-            thread.Interrupt();
-            thread.Join();
+            thread?.Interrupt();
+            thread?.Join();
         }
 
         public void Restart()
@@ -86,7 +91,8 @@ namespace VRCX
         {
             Factory f = new Factory1();
             _device = new Device(f.GetAdapter(OpenVR.System.GetD3D9AdapterIndex()),
-                DeviceCreationFlags.SingleThreaded | DeviceCreationFlags.BgraSupport);
+                DeviceCreationFlags.BgraSupport);
+            UpgradeDevice();
 
             _texture1?.Dispose();
             _texture1 = new Texture2D(
@@ -99,12 +105,11 @@ namespace VRCX
                     ArraySize = 1,
                     Format = Format.B8G8R8A8_UNorm,
                     SampleDescription = new SampleDescription(1, 0),
-                    Usage = ResourceUsage.Dynamic,
-                    BindFlags = BindFlags.ShaderResource,
-                    CpuAccessFlags = CpuAccessFlags.Write
+                    BindFlags = BindFlags.ShaderResource
                 }
             );
-            
+            _browser1?.UpdateRender(_device, _texture1);
+
             _texture2?.Dispose();
             _texture2 = new Texture2D(
                 _device,
@@ -116,11 +121,48 @@ namespace VRCX
                     ArraySize = 1,
                     Format = Format.B8G8R8A8_UNorm,
                     SampleDescription = new SampleDescription(1, 0),
-                    Usage = ResourceUsage.Dynamic,
-                    BindFlags = BindFlags.ShaderResource,
-                    CpuAccessFlags = CpuAccessFlags.Write
+                    BindFlags = BindFlags.ShaderResource
                 }
             );
+            _browser2?.UpdateRender(_device, _texture2);
+        }
+        
+        private void UpgradeDevice()
+        {
+            Device5 device5 = _device.QueryInterfaceOrNull<Device5>();
+            if (device5 != null)
+            {
+                _device.Dispose();
+                _device = device5;
+                return;
+            }
+            Device4 device4 = _device.QueryInterfaceOrNull<Device4>();
+            if (device4 != null)
+            {
+                _device.Dispose();
+                _device = device4;
+                return;
+            }
+            Device3 device3 = _device.QueryInterfaceOrNull<Device3>();
+            if (device3 != null)
+            {
+                _device.Dispose();
+                _device = device3;
+                return;
+            }
+            Device2 device2 = _device.QueryInterfaceOrNull<Device2>();
+            if (device2 != null)
+            {
+                _device.Dispose();
+                _device = device2;
+                return;
+            }
+            Device1 device1 = _device.QueryInterfaceOrNull<Device1>();
+            if (device1 != null)
+            {
+                _device.Dispose();
+                _device = device1;
+            }
         }
 
         private void ThreadLoop()
@@ -129,7 +171,7 @@ namespace VRCX
             var e = new VREvent_t();
             var nextInit = DateTime.MinValue;
             var nextDeviceUpdate = DateTime.MinValue;
-            var nextOverlay = DateTime.MinValue;
+            _nextOverlayUpdate = DateTime.MinValue;
             var overlayIndex = OpenVR.k_unTrackedDeviceIndexInvalid;
             var overlayVisible1 = false;
             var overlayVisible2 = false;
@@ -151,10 +193,6 @@ namespace VRCX
 
             while (_thread != null)
             {
-                if (_wristOverlayActive)
-                    _browser1.RenderToTexture(_texture1);
-                if (_hmdOverlayActive)
-                    _browser2.RenderToTexture(_texture2);
                 try
                 {
                     Thread.Sleep(32);
@@ -207,7 +245,7 @@ namespace VRCX
                             UpdateDevices(system, ref overlayIndex);
                             if (overlayIndex != OpenVR.k_unTrackedDeviceIndexInvalid)
                             {
-                                nextOverlay = DateTime.UtcNow.AddSeconds(10);
+                                _nextOverlayUpdate = DateTime.UtcNow.AddSeconds(10);
                             }
 
                             nextDeviceUpdate = DateTime.UtcNow.AddSeconds(0.1);
@@ -226,7 +264,7 @@ namespace VRCX
                                 logger.Error(err);
                             }
 
-                            err = ProcessOverlay1(overlay, ref overlayHandle1, ref overlayVisible1, dashboardVisible, overlayIndex, nextOverlay);
+                            err = ProcessOverlay1(overlay, ref overlayHandle1, ref overlayVisible1, dashboardVisible, overlayIndex);
                             if (err != EVROverlayError.None &&
                                 overlayHandle1 != 0)
                             {
@@ -397,6 +435,7 @@ namespace VRCX
                                 if (system.GetControllerState(i, ref state, (uint)Marshal.SizeOf(state)) &&
                                     (state.ulButtonPressed & (_menuButton ? 2u : isOculus ? 128u : 4u)) != 0)
                                 {
+                                    _nextOverlayUpdate = DateTime.MinValue;
                                     if (role == ETrackedControllerRole.LeftHand)
                                     {
                                         Array.Copy(_translationLeft, _translation, 3);
@@ -549,7 +588,7 @@ namespace VRCX
             return err;
         }
 
-        internal EVROverlayError ProcessOverlay1(CVROverlay overlay, ref ulong overlayHandle, ref bool overlayVisible, bool dashboardVisible, uint overlayIndex, DateTime nextOverlay)
+        internal EVROverlayError ProcessOverlay1(CVROverlay overlay, ref ulong overlayHandle, ref bool overlayVisible, bool dashboardVisible, uint overlayIndex)
         {
             var err = EVROverlayError.None;
 
@@ -622,7 +661,7 @@ namespace VRCX
             }
 
             if (!dashboardVisible &&
-                DateTime.UtcNow.CompareTo(nextOverlay) <= 0)
+                DateTime.UtcNow.CompareTo(_nextOverlayUpdate) <= 0)
             {
                 var texture = new Texture_t
                 {

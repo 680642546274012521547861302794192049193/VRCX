@@ -1,5 +1,6 @@
 using System;
 using System.IO;
+using System.Net;
 using CefSharp;
 using CefSharp.SchemeHandler;
 using CefSharp.WinForms;
@@ -9,6 +10,7 @@ namespace VRCX
     public class CefService
     {
         public static readonly CefService Instance;
+        private static readonly NLog.Logger logger = NLog.LogManager.GetLogger("VRCX");
 
         static CefService()
         {
@@ -25,9 +27,9 @@ namespace VRCX
                 LogSeverity = LogSeverity.Disable,
                 WindowlessRenderingEnabled = true,
                 PersistSessionCookies = true,
-                PersistUserPreferences = true,
                 UserAgent = Program.Version,
-                BrowserSubprocessPath = Environment.ProcessPath
+                BrowserSubprocessPath = Environment.ProcessPath,
+                BackgroundColor = 0xFF101010
             };
 
             cefSettings.RegisterScheme(new CefCustomScheme
@@ -49,15 +51,22 @@ namespace VRCX
             cefSettings.CefCommandLineArgs.Add("disable-pdf-extension");
             cefSettings.CefCommandLineArgs["autoplay-policy"] = "no-user-gesture-required";
             cefSettings.CefCommandLineArgs.Add("disable-web-security");
-            cefSettings.SetOffScreenRenderingBestPerformanceArgs(); // causes white screen sometimes?
+
+            if (WebApi.ProxySet)
+            {
+                cefSettings.CefCommandLineArgs["proxy-server"] = WebApi.ProxyUrl;
+            }
 
             if (Program.LaunchDebug)
             {
-                cefSettings.RemoteDebuggingPort = 8088;
+                // chrome://inspect/#devices
+                // Discover network targets, Configure...
+                // Add Remote Target: localhost:8089
+                logger.Info("Debug mode enabled");
+                cefSettings.RemoteDebuggingPort = 8089;
                 cefSettings.CefCommandLineArgs["remote-allow-origins"] = "*";
             }
-
-            //CefSharpSettings.WcfEnabled = true; // TOOD: REMOVE THIS LINE YO (needed for synchronous configRepository)
+            
             CefSharpSettings.ShutdownOnExit = false;
             CefSharpSettings.ConcurrentTaskExecution = true;
 

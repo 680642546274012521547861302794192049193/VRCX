@@ -1,17 +1,20 @@
 #!/usr/bin/env bash
-# Made by galister
 
-# change me
 steamapps=$HOME/.local/share/Steam/steamapps/compatdata
-download_url=https://github.com/vrcx-team/VRCX/releases/download/v2024.05.09/VRCX_20240509.zip
+stable="https://api0.vrcx.app/releases/stable/latest/download?type=zip"
+nightly="https://api0.vrcx.app/releases/nightly/latest/download?type=zip"
+download_url=$stable
+XDG_DATA_HOME=${XDG_DATA_HOME:=$HOME/.local/share}
 
-export WINEPREFIX=$HOME/.local/share/vrcx
+export WINEPREFIX="$XDG_DATA_HOME"/vrcx
+export WINEARCH=win64
 
 set -e
+set -u
 
 # Ensure Wine version >= 9.0
-wine_version=$(wine64 --version | grep -Po '(?<=wine-)([0-9.]+)')
-if [ "$1" != "force" ] && [[ $wine_version < 9.0 ]]; then
+wine_version=$(wine --version | grep -Po '(?<=wine-)([0-9.]+)')
+if [ "${1-}" != "force" ] && [[ $wine_version < 9.0 ]]; then
 	echo "Please upgrade your Wine version to 9.0 or higher."
 	echo "If you want to try anyway, run: install-vrcx.sh force"
 	exit 1
@@ -55,44 +58,38 @@ if [[ -d $vrc_appdata ]] && [[ ! -d $vrc_dst ]]; then
 	ln -s $vrc_appdata $vrc_dst
 fi
 
-winetricks --force -q corefonts
+winetricks --force -q corefonts # Workaround for https://bugs.winehq.org/show_bug.cgi?id=32342
 
 echo "Download VRCX"
 
 if [[ ! -d $WINEPREFIX/drive_c/vrcx ]]; then
 	mkdir -p $WINEPREFIX/drive_c/vrcx
+else
+   rm -r $WINEPREFIX/drive_c/vrcx/*
 fi
 
 cd $WINEPREFIX/drive_c/vrcx
-wget -q --show-progress $download_url -O vrcx.zip
+curl -L $download_url -o vrcx.zip
 unzip -uq vrcx.zip
 rm vrcx.zip
 
-echo '#!/usr/bin/env bash 
-export WINEPREFIX=$HOME/.local/share/vrcx
-wine64 $WINEPREFIX/drive_c/vrcx/VRCX.exe -no-cef-sandbox' >~/.local/share/vrcx/drive_c/vrcx/vrcx
-chmod +x ~/.local/share/vrcx/drive_c/vrcx/vrcx
+echo "#!/usr/bin/env bash
+export WINEPREFIX=$WINEPREFIX
+export WINEDLLOVERRIDES="libglesv2=d" # Workaround for https://bugs.winehq.org/show_bug.cgi?id=44985
+wine $WINEPREFIX/drive_c/vrcx/VRCX.exe" > $WINEPREFIX/drive_c/vrcx/vrcx
+chmod +x $WINEPREFIX/drive_c/vrcx/vrcx
 
-if [[ -d ~/.local/bin ]]; then
-	echo "Install VRCX to ~/.local/bin"
-	ln -s ~/.local/share/vrcx/drive_c/vrcx/vrcx ~/.local/bin/vrcx || true
-fi
+echo "Install VRCX.png to $XDG_DATA_HOME/icons"
+curl -L https://raw.githubusercontent.com/vrcx-team/VRCX/master/VRCX.png -o "$XDG_DATA_HOME/icons/VRCX.png"
 
-if [[ -d $HOME/.local/share/applications ]]; then
-	if [[ ! -f $HOME/.local/share/icons/VRCX.png ]]; then
-		echo "Install VRCX.png to ~/.local/share/icons"
-		cd ~/.local/share/icons/
-		wget -q --show-progress https://raw.githubusercontent.com/vrcx-team/VRCX/master/VRCX.png
-	fi
-
-	echo "Install vrcx.desktop to ~/.local/share/applications"
-	echo "[Desktop Entry]
+echo "Install vrcx.exe.desktop to $XDG_DATA_HOME/applications"
+echo "[Desktop Entry]
 Type=Application
 Name=VRCX
 Categories=Utility;
-Exec=/home/$USER/.local/share/vrcx/drive_c/vrcx/vrcx
+Exec=$WINEPREFIX/drive_c/vrcx/vrcx
 Icon=VRCX
-" >~/.local/share/applications/vrcx.desktop
-fi
+" > $XDG_DATA_HOME/applications/vrcx.exe.desktop
+
 
 echo "Done! Check your menu for VRCX."
